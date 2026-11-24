@@ -24,4 +24,6 @@ app.use('/api', publicRoutes)
 app.use('/api/billing', billingRoutes)
 app.use('/api/licenses', licenseRoutes)
 app.use((err, _req, res, _next) => { console.error(err); res.status(err.status || 400).json({ error: err.message || 'Erro interno.' }) })
-app.listen(port, () => console.log(`FOODCORE API executando em http://localhost:${port}`))
+app.listen(port, '0.0.0.0', () => {
+  console.log(`FOODCORE API executando na porta ${port}`)
+})
