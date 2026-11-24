@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react'
 import { Activity, ArrowLeft, CheckCircle2, CloudUpload, FileArchive, KeyRound, LogOut, RefreshCw, ShieldCheck } from 'lucide-react'
 import './admin.css'
 
-const API = import.meta.env.VITE_API_URL || 'http://localhost:3333/api'
+const API = import.meta.env.VITE_API_URL || 'https://foodcore-api.onrender.com/api'
 
 export default function AdminApp() {
   const [token, setToken] = useState(sessionStorage.getItem('foodcore_admin_token') || '')
