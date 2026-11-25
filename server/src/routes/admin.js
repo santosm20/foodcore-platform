@@ -19,6 +19,10 @@ import { getContractFile } from '../services/contractService.js'
 
 const router = Router()
 
+// =====================================================
+// CONFIGURAÇÕES
+// =====================================================
+
 const MAX_UPLOAD_MB = Math.max(
   1,
   Number(process.env.MAX_UPLOAD_MB || 500)
@@ -27,6 +31,59 @@ const MAX_UPLOAD_MB = Math.max(
 const MONTHLY_PRICE = 149.90
 const GRACE_DAYS = 5
 const RECEIPT_BUCKET = 'foodcore-payment-receipts'
+const BUSINESS_TIME_ZONE = 'America/Sao_Paulo'
+
+const PAYMENT_SELECT = `
+  id,
+  subscription_id,
+  amount,
+  due_date,
+  payment_date,
+  payment_method,
+  receipt_file_path,
+  status,
+  rejection_reason,
+  reviewed_at,
+  created_at
+`
+
+const SUBSCRIPTION_SELECT = `
+  id,
+  company_id,
+  contract_id,
+  monthly_price,
+  billing_day,
+  next_due_date,
+  grace_days,
+  status
+`
+
+const LICENSE_SELECT = `
+  id,
+  company_id,
+  subscription_id,
+  license_key,
+  status,
+  activated_at,
+  expires_at
+`
+
+const COMPANY_SELECT = `
+  id,
+  legal_name,
+  trade_name,
+  cnpj,
+  email,
+  phone,
+  representative_name,
+  representative_cpf,
+  city,
+  state,
+  status,
+  registration_status,
+  payment_link,
+  created_at
+`
 
 // =====================================================
 // UPLOAD DE VERSÕES
@@ -36,7 +93,10 @@ const upload = multer({
   storage: multer.diskStorage({
     destination: async (_req, _file, callback) => {
       try {
-        await fs.mkdir(releaseDirectory, { recursive: true })
+        await fs.mkdir(releaseDirectory, {
+          recursive: true
+        })
+
         callback(null, releaseDirectory)
       } catch (error) {
         callback(error)
@@ -54,8 +114,14 @@ const upload = multer({
   },
 
   fileFilter: (_req, file, callback) => {
-    if (path.extname(file.originalname).toLowerCase() !== '.exe') {
-      return callback(new Error('Envie somente arquivos .exe.'))
+    const extension = path.extname(
+      file.originalname
+    ).toLowerCase()
+
+    if (extension !== '.exe') {
+      return callback(
+        new Error('Envie somente arquivos .exe.')
+      )
     }
 
     callback(null, true)
@@ -63,7 +129,7 @@ const upload = multer({
 })
 
 // =====================================================
-// FUNÇÕES AUXILIARES
+// RESPOSTAS E UTILITÁRIOS
 // =====================================================
 
 function databaseUnavailable(res) {
@@ -78,10 +144,86 @@ function validUuid(value) {
   )
 }
 
+function logServerError(context, error) {
+  console.error(
+    `[FOODCORE] ${context}:`,
+    error?.message || error
+  )
+}
+
+function getMonthlyPrice(value) {
+  const price = Number(value)
+
+  if (!Number.isFinite(price) || price <= 0) {
+    return MONTHLY_PRICE
+  }
+
+  return Number(price.toFixed(2))
+}
+
+function getSafeFilename(value) {
+  return String(value || 'documento')
+    .replace(/[^a-zA-Z0-9._-]/g, '-')
+    .slice(0, 100)
+}
+
+function getAdminEmail(req) {
+  return req.admin?.email || null
+}
+
+function getDatePartsInTimeZone(date) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: BUSINESS_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(date)
+
+  const values = Object.fromEntries(
+    parts.map(part => [part.type, part.value])
+  )
+
+  return {
+    year: Number(values.year),
+    month: Number(values.month),
+    day: Number(values.day)
+  }
+}
+
+function validatePaymentLink(value) {
+  const link = String(value || '').trim()
+
+  if (!link || link.length > 2048) {
+    return null
+  }
+
+  try {
+    const url = new URL(link)
+
+    if (!['http:', 'https:'].includes(url.protocol)) {
+      return null
+    }
+
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
+// =====================================================
+// DATAS E COBRANÇAS
+// =====================================================
+
 function formatDateUTC(date) {
   const year = date.getUTCFullYear()
-  const month = String(date.getUTCMonth() + 1).padStart(2, '0')
-  const day = String(date.getUTCDate()).padStart(2, '0')
+
+  const month = String(
+    date.getUTCMonth() + 1
+  ).padStart(2, '0')
+
+  const day = String(
+    date.getUTCDate()
+  ).padStart(2, '0')
 
   return `${year}-${month}-${day}`
 }
@@ -103,29 +245,49 @@ function parseDateUTC(value) {
   return date
 }
 
-function getBillingDate(referenceDate, billingDay) {
-  const year = referenceDate.getUTCFullYear()
-  const month = referenceDate.getUTCMonth()
-
+function getBillingDateForMonth(
+  year,
+  monthZeroBased,
+  billingDay
+) {
   const lastDay = new Date(
-    Date.UTC(year, month + 1, 0)
+    Date.UTC(year, monthZeroBased + 1, 0)
   ).getUTCDate()
 
-  const day = Math.min(Number(billingDay), lastDay)
+  const day = Math.min(
+    Number(billingDay),
+    lastDay
+  )
 
   return formatDateUTC(
-    new Date(Date.UTC(year, month, day))
+    new Date(
+      Date.UTC(year, monthZeroBased, day)
+    )
   )
 }
 
 function getBillingDay(referenceDate) {
-  return referenceDate.getUTCDate()
+  return getDatePartsInTimeZone(referenceDate).day
+}
+
+function getBillingDate(referenceDate, billingDay) {
+  const { year, month } = getDatePartsInTimeZone(
+    referenceDate
+  )
+
+  return getBillingDateForMonth(
+    year,
+    month - 1,
+    billingDay
+  )
 }
 
 function addDaysToDate(dateString, days) {
   const date = parseDateUTC(dateString)
 
-  date.setUTCDate(date.getUTCDate() + Number(days))
+  date.setUTCDate(
+    date.getUTCDate() + Number(days)
+  )
 
   return formatDateUTC(date)
 }
@@ -141,22 +303,69 @@ function getNextBillingDate(currentDueDate, billingDay) {
     )
   )
 
-  return getBillingDate(nextMonth, billingDay)
+  return getBillingDateForMonth(
+    nextMonth.getUTCFullYear(),
+    nextMonth.getUTCMonth(),
+    billingDay
+  )
 }
 
 function getExpirationTimestamp(dateString) {
-  return `${dateString}T23:59:59.999Z`
-}
+  const date = parseDateUTC(dateString)
 
-function getMonthlyPrice(value) {
-  const price = Number(value)
+  const nextDayLocalAsUTC = Date.UTC(
+    date.getUTCFullYear(),
+    date.getUTCMonth(),
+    date.getUTCDate() + 1
+  )
 
-  if (!Number.isFinite(price) || price <= 0) {
-    return MONTHLY_PRICE
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: BUSINESS_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23'
+  })
+
+  let timestamp = nextDayLocalAsUTC
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const parts = formatter.formatToParts(
+      new Date(timestamp)
+    )
+
+    const values = Object.fromEntries(
+      parts
+        .filter(part => part.type !== 'literal')
+        .map(part => [
+          part.type,
+          Number(part.value)
+        ])
+    )
+
+    const representedAsUTC = Date.UTC(
+      values.year,
+      values.month - 1,
+      values.day,
+      values.hour,
+      values.minute,
+      values.second
+    )
+
+    const offset = representedAsUTC - timestamp
+
+    timestamp = nextDayLocalAsUTC - offset
   }
 
-  return Number(price.toFixed(2))
+  return new Date(timestamp - 1).toISOString()
 }
+
+// =====================================================
+// AUDITORIA ADMINISTRATIVA
+// =====================================================
 
 async function registerAdminLog({
   companyId,
@@ -164,26 +373,57 @@ async function registerAdminLog({
   details = {},
   adminEmail
 }) {
-  const { error } = await supabase
-    .from('admin_logs')
-    .insert({
-      admin_id: null,
-      company_id: companyId || null,
-      action,
-      details: {
-        ...details,
-        admin_email: adminEmail || null,
-        timestamp: new Date().toISOString()
-      }
-    })
+  if (!supabase) {
+    logServerError(
+      'Auditoria não registrada',
+      'Supabase indisponível.'
+    )
 
-  if (error) throw error
+    return false
+  }
+
+  try {
+    const { error } = await supabase
+      .from('admin_logs')
+      .insert({
+        admin_id: null,
+        company_id: companyId || null,
+        action,
+        details: {
+          ...details,
+          admin_email: adminEmail || null,
+          timestamp: new Date().toISOString()
+        }
+      })
+
+    if (error) {
+      logServerError(
+        'Falha ao registrar auditoria',
+        error
+      )
+
+      return false
+    }
+
+    return true
+  } catch (error) {
+    logServerError(
+      'Exceção ao registrar auditoria',
+      error
+    )
+
+    return false
+  }
 }
 
+// =====================================================
+// ARQUIVOS
+// =====================================================
+
 async function removeUploadedFile(file) {
-  if (file?.path) {
-    await fs.unlink(file.path).catch(() => {})
-  }
+  if (!file?.path) return
+
+  await fs.unlink(file.path).catch(() => {})
 }
 
 async function calculateFileHash(filePath) {
@@ -193,19 +433,70 @@ async function calculateFileHash(filePath) {
     createReadStream(filePath)
       .on('data', chunk => digest.update(chunk))
       .on('error', reject)
-      .on('end', () => resolve(digest.digest('hex')))
+      .on('end', () => {
+        resolve(digest.digest('hex'))
+      })
   })
 }
 
-function getSafeFilename(value) {
-  return String(value || 'documento')
-    .replace(/[^a-zA-Z0-9._-]/g, '-')
-    .slice(0, 100)
+async function validateExecutableFile(filePath) {
+  const handle = await fs.open(filePath, 'r')
+
+  try {
+    const header = Buffer.alloc(4096)
+
+    const { bytesRead } = await handle.read(
+      header,
+      0,
+      header.length,
+      0
+    )
+
+    if (
+      bytesRead < 64 ||
+      header[0] !== 0x4D ||
+      header[1] !== 0x5A
+    ) {
+      return false
+    }
+
+    const peOffset = header.readUInt32LE(0x3C)
+
+    if (
+      peOffset < 64 ||
+      peOffset + 4 > bytesRead
+    ) {
+      return false
+    }
+
+    return header
+      .subarray(peOffset, peOffset + 4)
+      .equals(
+        Buffer.from([0x50, 0x45, 0x00, 0x00])
+      )
+  } finally {
+    await handle.close()
+  }
 }
 
 // =====================================================
 // COBRANÇAS
 // =====================================================
+
+async function findPaymentForSubscription(subscription) {
+  const { data, error } = await supabase
+    .from('payments')
+    .select(PAYMENT_SELECT)
+    .eq('subscription_id', subscription.id)
+    .eq('due_date', subscription.next_due_date)
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle()
+
+  if (error) throw error
+
+  return data
+}
 
 async function ensurePaymentForSubscription(subscription) {
   if (
@@ -217,85 +508,111 @@ async function ensurePaymentForSubscription(subscription) {
     )
   }
 
-  const amount = getMonthlyPrice(subscription.monthly_price)
+  parseDateUTC(subscription.next_due_date)
 
-  // Verifica se já existe cobrança para o vencimento.
-  const { data: existingPayment, error: findError } = await supabase
-    .from('payments')
-    .select(`
-      id,
-      subscription_id,
-      amount,
-      due_date,
-      payment_date,
-      payment_method,
-      receipt_file_path,
-      status,
-      created_at
-    `)
-    .eq('subscription_id', subscription.id)
-    .eq('due_date', subscription.next_due_date)
-    .maybeSingle()
-
-  if (findError) throw findError
+  const existingPayment = await findPaymentForSubscription(
+    subscription
+  )
 
   if (existingPayment) {
     return existingPayment
   }
 
-  // Cria a cobrança que ainda não existe.
-  const { data: payment, error: insertError } = await supabase
-    .from('payments')
-    .insert({
-      subscription_id: subscription.id,
-      amount,
-      due_date: subscription.next_due_date,
-      status: 'pending'
-    })
-    .select(`
-      id,
-      subscription_id,
-      amount,
-      due_date,
-      payment_date,
-      payment_method,
-      receipt_file_path,
-      status,
-      created_at
-    `)
-    .single()
+  const { data: payment, error: insertError } =
+    await supabase
+      .from('payments')
+      .insert({
+        subscription_id: subscription.id,
+        amount: getMonthlyPrice(
+          subscription.monthly_price
+        ),
+        due_date: subscription.next_due_date,
+        status: 'pending'
+      })
+      .select(PAYMENT_SELECT)
+      .single()
 
-  if (insertError) {
-    // Protege contra uma segunda requisição que tenha criado
-    // a mesma cobrança praticamente ao mesmo tempo.
-    const { data: paymentAfterConflict, error: retryError } =
-      await supabase
-        .from('payments')
-        .select(`
-          id,
-          subscription_id,
-          amount,
-          due_date,
-          payment_date,
-          payment_method,
-          receipt_file_path,
-          status,
-          created_at
-        `)
-        .eq('subscription_id', subscription.id)
-        .eq('due_date', subscription.next_due_date)
-        .maybeSingle()
-
-    if (retryError) throw retryError
-
-    if (paymentAfterConflict) {
-      return paymentAfterConflict
-    }
-
-    throw insertError
+  if (!insertError) {
+    return payment
   }
 
-  return payment
+  const paymentAfterInsert = await findPaymentForSubscription(
+    subscription
+  )
+
+  if (paymentAfterInsert) {
+    return paymentAfterInsert
+  }
+
+  throw insertError
+}
+
+// =====================================================
+// ASSINATURAS SEM CONTRATO
+// =====================================================
+
+async function findOrCreateCustomerSubscription(companyId) {
+  const { data: existingSubscriptions, error } =
+    await supabase
+      .from('subscriptions')
+      .select(SUBSCRIPTION_SELECT)
+      .eq('company_id', companyId)
+      .is('contract_id', null)
+      .order('created_at', { ascending: false })
+      .limit(1)
+
+  if (error) throw error
+
+  let subscription = existingSubscriptions?.[0] || null
+
+  if (!subscription) {
+    const referenceDate = new Date()
+    const billingDay = getBillingDay(referenceDate)
+
+    const nextDueDate = getBillingDate(
+      referenceDate,
+      billingDay
+    )
+
+    const { data: createdSubscription, error: createError } =
+      await supabase
+        .from('subscriptions')
+        .insert({
+          company_id: companyId,
+          contract_id: null,
+          monthly_price: MONTHLY_PRICE,
+          billing_day: billingDay,
+          next_due_date: nextDueDate,
+          grace_days: GRACE_DAYS,
+          status: 'pending'
+        })
+        .select(SUBSCRIPTION_SELECT)
+        .single()
+
+    if (createError) {
+      // Recupera uma assinatura criada simultaneamente.
+      const { data: retrySubscriptions, error: retryError } =
+        await supabase
+          .from('subscriptions')
+          .select(SUBSCRIPTION_SELECT)
+          .eq('company_id', companyId)
+          .is('contract_id', null)
+          .order('created_at', { ascending: false })
+          .limit(1)
+
+      if (retryError) throw retryError
+
+      if (!retrySubscriptions?.length) {
+        throw createError
+      }
+
+      subscription = retrySubscriptions[0]
+    } else {
+      subscription = createdSubscription
+    }
+  }
+
+  return subscription
 }
 
 // =====================================================
@@ -320,20 +637,13 @@ async function enrichPayments(payments) {
     }))
   }
 
-  const { data: subscriptions, error: subscriptionError } =
-    await supabase
-      .from('subscriptions')
-      .select(`
-        id,
-        company_id,
-        contract_id,
-        monthly_price,
-        billing_day,
-        next_due_date,
-        grace_days,
-        status
-      `)
-      .in('id', subscriptionIds)
+  const {
+    data: subscriptions,
+    error: subscriptionError
+  } = await supabase
+    .from('subscriptions')
+    .select(SUBSCRIPTION_SELECT)
+    .in('id', subscriptionIds)
 
   if (subscriptionError) throw subscriptionError
 
@@ -353,7 +663,10 @@ async function enrichPayments(payments) {
     )
   ]
 
-  const [companiesResult, contractsResult] = await Promise.all([
+  const [
+    companiesResult,
+    contractsResult
+  ] = await Promise.all([
     companyIds.length
       ? supabase
           .from('companies')
@@ -367,7 +680,10 @@ async function enrichPayments(payments) {
             representative_name
           `)
           .in('id', companyIds)
-      : Promise.resolve({ data: [], error: null }),
+      : Promise.resolve({
+          data: [],
+          error: null
+        }),
 
     contractIds.length
       ? supabase
@@ -381,22 +697,39 @@ async function enrichPayments(payments) {
             approved_at
           `)
           .in('id', contractIds)
-      : Promise.resolve({ data: [], error: null })
+      : Promise.resolve({
+          data: [],
+          error: null
+        })
   ])
 
-  if (companiesResult.error) throw companiesResult.error
-  if (contractsResult.error) throw contractsResult.error
+  if (companiesResult.error) {
+    throw companiesResult.error
+  }
+
+  if (contractsResult.error) {
+    throw contractsResult.error
+  }
 
   const subscriptionMap = new Map(
-    (subscriptions || []).map(item => [item.id, item])
+    (subscriptions || []).map(item => [
+      item.id,
+      item
+    ])
   )
 
   const companyMap = new Map(
-    (companiesResult.data || []).map(item => [item.id, item])
+    (companiesResult.data || []).map(item => [
+      item.id,
+      item
+    ])
   )
 
   const contractMap = new Map(
-    (contractsResult.data || []).map(item => [item.id, item])
+    (contractsResult.data || []).map(item => [
+      item.id,
+      item
+    ])
   )
 
   return payments.map(payment => {
@@ -415,8 +748,10 @@ async function enrichPayments(payments) {
       ...payment,
       subscription: {
         ...subscription,
-        company: companyMap.get(subscription.company_id) || null,
-        contract: contractMap.get(subscription.contract_id) || null
+        company:
+          companyMap.get(subscription.company_id) || null,
+        contract:
+          contractMap.get(subscription.contract_id) || null
       }
     }
   })
@@ -428,13 +763,20 @@ async function enrichPayments(payments) {
 
 router.post('/login', async (req, res) => {
   try {
-    const { email, password } = req.body || {}
+    const {
+      email,
+      password
+    } = req.body || {}
 
     const adminEmail = process.env.ADMIN_EMAIL
     const adminPassword = process.env.ADMIN_PASSWORD
     const jwtSecret = process.env.JWT_SECRET
 
-    if (!adminEmail || !adminPassword || !jwtSecret) {
+    if (
+      !adminEmail ||
+      !adminPassword ||
+      !jwtSecret
+    ) {
       return res.status(503).json({
         error: 'Credenciais administrativas não configuradas no servidor.'
       })
@@ -444,13 +786,16 @@ router.post('/login', async (req, res) => {
       .trim()
       .toLowerCase()
 
+    const submittedPassword = String(password || '')
+
     const validEmail =
       submittedEmail === adminEmail.trim().toLowerCase()
 
-    const submittedPassword = String(password || '')
-
     const validPassword = adminPassword.startsWith('$2')
-      ? await bcrypt.compare(submittedPassword, adminPassword)
+      ? await bcrypt.compare(
+          submittedPassword,
+          adminPassword
+        )
       : submittedPassword === adminPassword
 
     if (!validEmail || !validPassword) {
@@ -476,9 +821,9 @@ router.post('/login', async (req, res) => {
       expiresIn: 28800
     })
   } catch (error) {
-    console.error(
-      '[FOODCORE] Erro no login administrativo:',
-      error.message
+    logServerError(
+      'Erro no login administrativo',
+      error
     )
 
     return res.status(500).json({
@@ -488,12 +833,244 @@ router.post('/login', async (req, res) => {
 })
 
 // =====================================================
+// CADASTROS - LISTAGEM DE EMPRESAS PENDENTES
+// =====================================================
+
+router.get('/customers/pending', requireAdmin, async (_req, res) => {
+  try {
+    if (!supabase) {
+      return databaseUnavailable(res)
+    }
+
+    const { data, error } = await supabase
+      .from('companies')
+      .select(COMPANY_SELECT)
+      .eq('registration_status', 'pending_review')
+      .order('created_at', { ascending: true })
+
+    if (error) throw error
+
+    return res.json({
+      success: true,
+      customers: data || []
+    })
+  } catch (error) {
+    logServerError(
+      'Erro ao listar cadastros pendentes',
+      error
+    )
+
+    return res.status(500).json({
+      error: 'Não foi possível carregar os cadastros pendentes.'
+    })
+  }
+})
+
+// =====================================================
+// CADASTROS - DETALHES DA EMPRESA
+// =====================================================
+
+router.get('/customers/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) {
+      return databaseUnavailable(res)
+    }
+
+    const companyId = req.params.id
+
+    if (!validUuid(companyId)) {
+      return res.status(400).json({
+        error: 'Identificador de empresa inválido.'
+      })
+    }
+
+    const { data: company, error } = await supabase
+      .from('companies')
+      .select(COMPANY_SELECT)
+      .eq('id', companyId)
+      .maybeSingle()
+
+    if (error) throw error
+
+    if (!company) {
+      return res.status(404).json({
+        error: 'Empresa não encontrada.'
+      })
+    }
+
+    const {
+      data: subscriptions,
+      error: subscriptionError
+    } = await supabase
+      .from('subscriptions')
+      .select(SUBSCRIPTION_SELECT)
+      .eq('company_id', companyId)
+      .order('created_at', { ascending: false })
+
+    if (subscriptionError) throw subscriptionError
+
+    return res.json({
+      success: true,
+      company,
+      subscriptions: subscriptions || []
+    })
+  } catch (error) {
+    logServerError(
+      'Erro ao consultar empresa',
+      error
+    )
+
+    return res.status(500).json({
+      error: 'Não foi possível consultar a empresa.'
+    })
+  }
+})
+
+// =====================================================
+// CADASTROS - VINCULAR LINK DE PAGAMENTO
+// =====================================================
+
+router.patch(
+  '/customers/:id/payment-link',
+  requireAdmin,
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return databaseUnavailable(res)
+      }
+
+      const companyId = req.params.id
+
+      if (!validUuid(companyId)) {
+        return res.status(400).json({
+          error: 'Identificador de empresa inválido.'
+        })
+      }
+
+      const paymentLink = validatePaymentLink(
+        req.body?.payment_link
+      )
+
+      if (!paymentLink) {
+        return res.status(400).json({
+          error: 'Informe um link HTTP ou HTTPS válido, com até 2.048 caracteres.'
+        })
+      }
+
+      const {
+        data: company,
+        error: companyFindError
+      } = await supabase
+        .from('companies')
+        .select(`
+          id,
+          legal_name,
+          registration_status
+        `)
+        .eq('id', companyId)
+        .maybeSingle()
+
+      if (companyFindError) throw companyFindError
+
+      if (!company) {
+        return res.status(404).json({
+          error: 'Empresa não encontrada.'
+        })
+      }
+
+      if (
+        !['pending_review', 'awaiting_payment'].includes(
+          company.registration_status
+        )
+      ) {
+        return res.status(409).json({
+          error: 'Este cadastro não permite alteração do link de pagamento.'
+        })
+      }
+
+      // Cria ou reutiliza a assinatura sem contrato.
+      const subscription = await findOrCreateCustomerSubscription(
+        companyId
+      )
+
+      // Garante a existência da primeira cobrança.
+      const payment = await ensurePaymentForSubscription(
+        subscription
+      )
+
+      // Atualiza somente enquanto o cadastro ainda
+      // estiver em uma etapa que permite receber o link.
+      const {
+        data: updatedCompany,
+        error: updateError
+      } = await supabase
+        .from('companies')
+        .update({
+          payment_link: paymentLink,
+          registration_status: 'awaiting_payment'
+        })
+        .eq('id', companyId)
+        .in('registration_status', [
+          'pending_review',
+          'awaiting_payment'
+        ])
+        .select(`
+          id,
+          legal_name,
+          registration_status
+        `)
+        .maybeSingle()
+
+      if (updateError) throw updateError
+
+      if (!updatedCompany) {
+        return res.status(409).json({
+          error: 'O cadastro foi alterado durante a operação. Atualize a página.'
+        })
+      }
+
+      await registerAdminLog({
+        companyId,
+        action: 'customer_payment_link_created',
+        adminEmail: getAdminEmail(req),
+        details: {
+          subscription_id: subscription.id,
+          payment_id: payment.id,
+          amount: payment.amount,
+          due_date: payment.due_date,
+          payment_link_updated: true
+        }
+      })
+
+      return res.json({
+        success: true,
+        message: 'Link de pagamento vinculado. Empresa aguardando pagamento.',
+        company: updatedCompany,
+        subscription,
+        payment
+      })
+    } catch (error) {
+      logServerError(
+        'Erro ao vincular link de pagamento',
+        error
+      )
+
+      return res.status(500).json({
+        error: 'Não foi possível vincular o link de pagamento.'
+      })
+    }
+  }
+)
+
+// =====================================================
 // CONTRATOS - LISTAGEM
 // =====================================================
 
 router.get('/contracts', requireAdmin, async (_req, res) => {
   try {
-    if (!supabase) return databaseUnavailable(res)
+    if (!supabase) {
+      return databaseUnavailable(res)
+    }
 
     const { data: contracts, error } = await supabase
       .from('contracts')
@@ -503,7 +1080,6 @@ router.get('/contracts', requireAdmin, async (_req, res) => {
         contract_number,
         monthly_price,
         status,
-        signed_file_path,
         signed_at,
         created_at,
         approved_at
@@ -521,35 +1097,43 @@ router.get('/contracts', requireAdmin, async (_req, res) => {
     }
 
     const companyIds = [
-      ...new Set(contracts.map(contract => contract.company_id))
+      ...new Set(
+        contracts
+          .map(contract => contract.company_id)
+          .filter(Boolean)
+      )
     ]
 
-    const { data: companies, error: companyError } = await supabase
-      .from('companies')
-      .select(`
-        id,
-        legal_name,
-        trade_name,
-        cnpj,
-        email,
-        phone,
-        representative_name,
-        representative_cpf,
-        city,
-        state
-      `)
-      .in('id', companyIds)
+    const { data: companies, error: companyError } =
+      await supabase
+        .from('companies')
+        .select(`
+          id,
+          legal_name,
+          trade_name,
+          cnpj,
+          email,
+          phone,
+          representative_name,
+          representative_cpf,
+          city,
+          state
+        `)
+        .in('id', companyIds)
 
     if (companyError) throw companyError
 
     const companyMap = new Map(
-      (companies || []).map(company => [company.id, company])
+      (companies || []).map(company => [
+        company.id,
+        company
+      ])
     )
 
     const result = contracts.map(contract => ({
       ...contract,
-      signed_file_path: undefined,
-      company: companyMap.get(contract.company_id) || null
+      company:
+        companyMap.get(contract.company_id) || null
     }))
 
     return res.json({
@@ -557,9 +1141,9 @@ router.get('/contracts', requireAdmin, async (_req, res) => {
       contracts: result
     })
   } catch (error) {
-    console.error(
-      '[FOODCORE] Erro ao listar contratos:',
-      error.message
+    logServerError(
+      'Erro ao listar contratos',
+      error
     )
 
     return res.status(500).json({
@@ -577,7 +1161,9 @@ router.get(
   requireAdmin,
   async (req, res) => {
     try {
-      if (!supabase) return databaseUnavailable(res)
+      if (!supabase) {
+        return databaseUnavailable(res)
+      }
 
       const contractId = req.params.id
 
@@ -589,7 +1175,11 @@ router.get(
 
       const { data: contract, error } = await supabase
         .from('contracts')
-        .select('id, contract_number, signed_file_path')
+        .select(`
+          id,
+          contract_number,
+          signed_file_path
+        `)
         .eq('id', contractId)
         .maybeSingle()
 
@@ -605,22 +1195,46 @@ router.get(
         contract.signed_file_path
       )
 
+      if (!Buffer.isBuffer(file)) {
+        throw new Error(
+          'Arquivo do contrato inválido.'
+        )
+      }
+
       const filename = getSafeFilename(
         `contrato-assinado-${contract.contract_number}.pdf`
       )
 
-      res.setHeader('Content-Type', 'application/pdf')
+      res.setHeader(
+        'Content-Type',
+        'application/pdf'
+      )
+
       res.setHeader(
         'Content-Disposition',
         `attachment; filename="${filename}"`
       )
-      res.setHeader('Content-Length', file.length)
+
+      res.setHeader(
+        'Content-Length',
+        file.length
+      )
+
+      res.setHeader(
+        'Cache-Control',
+        'private, no-store'
+      )
+
+      res.setHeader(
+        'X-Content-Type-Options',
+        'nosniff'
+      )
 
       return res.send(file)
     } catch (error) {
-      console.error(
-        '[FOODCORE] Erro ao baixar contrato administrativo:',
-        error.message
+      logServerError(
+        'Erro ao baixar contrato administrativo',
+        error
       )
 
       return res.status(500).json({
@@ -639,9 +1253,12 @@ router.patch(
   requireAdmin,
   async (req, res) => {
     try {
-      if (!supabase) return databaseUnavailable(res)
+      if (!supabase) {
+        return databaseUnavailable(res)
+      }
 
       const contractId = req.params.id
+
       const decision = String(
         req.body?.decision || ''
       ).trim().toLowerCase()
@@ -662,7 +1279,10 @@ router.patch(
         })
       }
 
-      if (decision === 'reject' && reason.length < 5) {
+      if (
+        decision === 'reject' &&
+        reason.length < 5
+      ) {
         return res.status(400).json({
           error: 'Informe uma justificativa para rejeitar o contrato.'
         })
@@ -674,7 +1294,10 @@ router.patch(
         })
       }
 
-      const { data: currentContract, error: findError } = await supabase
+      const {
+        data: currentContract,
+        error: findError
+      } = await supabase
         .from('contracts')
         .select(`
           id,
@@ -695,76 +1318,54 @@ router.patch(
         })
       }
 
-      if (currentContract.status !== 'awaiting_approval') {
+      if (
+        currentContract.status !== 'awaiting_approval' &&
+        !(
+          decision === 'approve' &&
+          currentContract.status === 'approved'
+        )
+      ) {
         return res.status(409).json({
           error: 'Este contrato não está aguardando análise.'
         })
       }
 
-      const timestamp = new Date().toISOString()
-
-      const updateData = {
-        status: decision === 'approve' ? 'approved' : 'rejected'
-      }
-
-      if (decision === 'approve') {
-        updateData.approved_by = null
-        updateData.approved_at = timestamp
-      }
-
-      const { data: contract, error: updateError } = await supabase
-        .from('contracts')
-        .update(updateData)
-        .eq('id', contractId)
-        .eq('status', 'awaiting_approval')
-        .select(`
-          id,
-          company_id,
-          contract_number,
-          status,
-          approved_at
-        `)
-        .maybeSingle()
-
-      if (updateError) throw updateError
-
-      if (!contract) {
-        return res.status(409).json({
-          error: 'O contrato foi alterado por outra operação. Atualize a lista.'
-        })
-      }
-
       let subscription = null
       let payment = null
+      let contract = currentContract
+
+      // -------------------------------------------------
+      // PREPARAÇÃO DA ASSINATURA E PRIMEIRA COBRANÇA
+      // -------------------------------------------------
 
       if (decision === 'approve') {
-        const { data: existingSubscription, error: subscriptionFindError } =
-          await supabase
-            .from('subscriptions')
-            .select(`
-              id,
-              company_id,
-              contract_id,
-              monthly_price,
-              billing_day,
-              next_due_date,
-              grace_days,
-              status
-            `)
-            .eq('contract_id', contractId)
-            .maybeSingle()
+        const {
+          data: existingSubscriptions,
+          error: subscriptionFindError
+        } = await supabase
+          .from('subscriptions')
+          .select(SUBSCRIPTION_SELECT)
+          .eq('contract_id', contractId)
+          .order('created_at', { ascending: true })
+          .limit(1)
 
-        if (subscriptionFindError) throw subscriptionFindError
+        if (subscriptionFindError) {
+          throw subscriptionFindError
+        }
 
-        if (existingSubscription) {
-          subscription = existingSubscription
-        } else {
+        subscription = existingSubscriptions?.[0] || null
+
+        if (!subscription) {
           const referenceDate = currentContract.created_at
             ? new Date(currentContract.created_at)
             : new Date()
 
-          if (Number.isNaN(referenceDate.getTime())) {
-            throw new Error('Data de criação do contrato inválida.')
+          if (
+            Number.isNaN(referenceDate.getTime())
+          ) {
+            throw new Error(
+              'Data de criação do contrato inválida.'
+            )
           }
 
           const billingDay = getBillingDay(referenceDate)
@@ -774,40 +1375,99 @@ router.patch(
             billingDay
           )
 
-          const { data: newSubscription, error: createError } =
-            await supabase
+          const {
+            data: newSubscription,
+            error: createError
+          } = await supabase
+            .from('subscriptions')
+            .insert({
+              company_id: currentContract.company_id,
+              contract_id: currentContract.id,
+              monthly_price: getMonthlyPrice(
+                currentContract.monthly_price
+              ),
+              billing_day: billingDay,
+              next_due_date: nextDueDate,
+              grace_days: GRACE_DAYS,
+              status: 'pending'
+            })
+            .select(SUBSCRIPTION_SELECT)
+            .single()
+
+          if (createError) {
+            const {
+              data: retrySubscriptions,
+              error: retryError
+            } = await supabase
               .from('subscriptions')
-              .insert({
-                company_id: currentContract.company_id,
-                contract_id: currentContract.id,
-                monthly_price: getMonthlyPrice(
-                  currentContract.monthly_price
-                ),
-                billing_day: billingDay,
-                next_due_date: nextDueDate,
-                grace_days: GRACE_DAYS,
-                status: 'pending'
-              })
-              .select(`
-                id,
-                company_id,
-                contract_id,
-                monthly_price,
-                billing_day,
-                next_due_date,
-                grace_days,
-                status
-              `)
-              .single()
+              .select(SUBSCRIPTION_SELECT)
+              .eq('contract_id', contractId)
+              .order('created_at', { ascending: true })
+              .limit(1)
 
-          if (createError) throw createError
+            if (retryError) throw retryError
 
-          subscription = newSubscription
+            if (!retrySubscriptions?.length) {
+              throw createError
+            }
+
+            subscription = retrySubscriptions[0]
+          } else {
+            subscription = newSubscription
+          }
         }
 
-        // PRIMEIRA COBRANÇA AUTOMÁTICA.
-        // Também recupera assinaturas que já existiam sem cobrança.
-        payment = await ensurePaymentForSubscription(subscription)
+        payment = await ensurePaymentForSubscription(
+          subscription
+        )
+      }
+
+      // -------------------------------------------------
+      // ATUALIZA CONTRATO
+      // -------------------------------------------------
+
+      if (
+        currentContract.status === 'awaiting_approval'
+      ) {
+        const timestamp = new Date().toISOString()
+
+        const updateData = {
+          status: decision === 'approve'
+            ? 'approved'
+            : 'rejected'
+        }
+
+        if (decision === 'approve') {
+          updateData.approved_by = null
+          updateData.approved_at = timestamp
+        }
+
+        const {
+          data: updatedContract,
+          error: updateError
+        } = await supabase
+          .from('contracts')
+          .update(updateData)
+          .eq('id', contractId)
+          .eq('status', 'awaiting_approval')
+          .select(`
+            id,
+            company_id,
+            contract_number,
+            status,
+            approved_at
+          `)
+          .maybeSingle()
+
+        if (updateError) throw updateError
+
+        if (!updatedContract) {
+          return res.status(409).json({
+            error: 'O contrato foi alterado por outra operação. Atualize a lista.'
+          })
+        }
+
+        contract = updatedContract
       }
 
       await registerAdminLog({
@@ -815,14 +1475,16 @@ router.patch(
         action: decision === 'approve'
           ? 'contract_approved'
           : 'contract_rejected',
-        adminEmail: req.admin?.email,
+        adminEmail: getAdminEmail(req),
         details: {
           contract_id: currentContract.id,
           contract_number: currentContract.contract_number,
           decision,
           subscription_id: subscription?.id || null,
           payment_id: payment?.id || null,
-          reason: decision === 'reject' ? reason : null
+          reason: decision === 'reject'
+            ? reason
+            : null
         }
       })
 
@@ -836,14 +1498,13 @@ router.patch(
         payment
       })
     } catch (error) {
-      console.error(
-        '[FOODCORE] Erro na decisão do contrato:',
-        error.message
+      logServerError(
+        'Erro na decisão do contrato',
+        error
       )
 
       return res.status(500).json({
-        error: 'Não foi possível concluir a decisão do contrato.',
-        details: error.message
+        error: 'Não foi possível concluir a decisão do contrato.'
       })
     }
   }
@@ -855,67 +1516,61 @@ router.patch(
 
 router.get('/payments', requireAdmin, async (_req, res) => {
   try {
-    if (!supabase) return databaseUnavailable(res)
+    if (!supabase) {
+      return databaseUnavailable(res)
+    }
 
-    // Recupera assinaturas que podem possuir cobranças pendentes.
-    const { data: subscriptions, error: subscriptionError } =
-      await supabase
-        .from('subscriptions')
-        .select(`
-          id,
-          company_id,
-          contract_id,
-          monthly_price,
-          billing_day,
-          next_due_date,
-          grace_days,
-          status
-        `)
-        .in('status', ['pending', 'active', 'past_due', 'suspended'])
+    const {
+      data: subscriptions,
+      error: subscriptionError
+    } = await supabase
+      .from('subscriptions')
+      .select(SUBSCRIPTION_SELECT)
+      .in('status', [
+        'pending',
+        'active',
+        'past_due',
+        'suspended'
+      ])
 
-    if (subscriptionError) throw subscriptionError
+    if (subscriptionError) {
+      throw subscriptionError
+    }
 
-    // Garante uma cobrança para cada vencimento atual.
-    // Isso também corrige assinaturas antigas que ficaram sem pagamento.
     for (const subscription of subscriptions || []) {
       await ensurePaymentForSubscription(subscription)
     }
 
-    const { data: payments, error: paymentError } = await supabase
+    const {
+      data: payments,
+      error: paymentError
+    } = await supabase
       .from('payments')
-      .select(`
-        id,
-        subscription_id,
-        amount,
-        due_date,
-        payment_date,
-        payment_method,
-        receipt_file_path,
-        status,
-        rejection_reason,
-        reviewed_at,
-        created_at
-      `)
-      .in('status', ['pending', 'under_review'])
+      .select(PAYMENT_SELECT)
+      .in('status', [
+        'pending',
+        'under_review'
+      ])
       .order('created_at', { ascending: true })
 
     if (paymentError) throw paymentError
 
-    const enrichedPayments = await enrichPayments(payments || [])
+    const enrichedPayments = await enrichPayments(
+      payments || []
+    )
 
     return res.json({
       success: true,
       payments: enrichedPayments
     })
   } catch (error) {
-    console.error(
-      '[FOODCORE] Erro ao listar pagamentos:',
-      error.message
+    logServerError(
+      'Erro ao listar pagamentos',
+      error
     )
 
     return res.status(500).json({
-      error: 'Não foi possível carregar os pagamentos.',
-      details: error.message
+      error: 'Não foi possível carregar os pagamentos.'
     })
   }
 })
@@ -924,47 +1579,49 @@ router.get('/payments', requireAdmin, async (_req, res) => {
 // PAGAMENTOS - HISTÓRICO ADMINISTRATIVO
 // =====================================================
 
-router.get('/payments/history', requireAdmin, async (_req, res) => {
-  try {
-    if (!supabase) return databaseUnavailable(res)
+router.get(
+  '/payments/history',
+  requireAdmin,
+  async (_req, res) => {
+    try {
+      if (!supabase) {
+        return databaseUnavailable(res)
+      }
 
-    const { data: payments, error } = await supabase
-      .from('payments')
-      .select(`
-        id,
-        subscription_id,
-        amount,
-        due_date,
-        payment_date,
-        payment_method,
-        status,
-        rejection_reason,
-        reviewed_at,
-        created_at
-      `)
-      .in('status', ['confirmed', 'rejected'])
-      .order('reviewed_at', { ascending: false })
-      .limit(200)
+      const { data: payments, error } = await supabase
+        .from('payments')
+        .select(PAYMENT_SELECT)
+        .in('status', [
+          'confirmed',
+          'rejected'
+        ])
+        .order('reviewed_at', {
+          ascending: false
+        })
+        .limit(200)
 
-    if (error) throw error
+      if (error) throw error
 
-    const enrichedPayments = await enrichPayments(payments || [])
+      const enrichedPayments = await enrichPayments(
+        payments || []
+      )
 
-    return res.json({
-      success: true,
-      payments: enrichedPayments
-    })
-  } catch (error) {
-    console.error(
-      '[FOODCORE] Erro ao listar histórico de pagamentos:',
-      error.message
-    )
+      return res.json({
+        success: true,
+        payments: enrichedPayments
+      })
+    } catch (error) {
+      logServerError(
+        'Erro ao listar histórico de pagamentos',
+        error
+      )
 
-    return res.status(500).json({
-      error: 'Não foi possível carregar o histórico de pagamentos.'
-    })
+      return res.status(500).json({
+        error: 'Não foi possível carregar o histórico de pagamentos.'
+      })
+    }
   }
-})
+)
 
 // =====================================================
 // PAGAMENTOS - DOWNLOAD DO COMPROVANTE
@@ -975,7 +1632,9 @@ router.get(
   requireAdmin,
   async (req, res) => {
     try {
-      if (!supabase) return databaseUnavailable(res)
+      if (!supabase) {
+        return databaseUnavailable(res)
+      }
 
       const paymentId = req.params.id
 
@@ -987,7 +1646,10 @@ router.get(
 
       const { data: payment, error } = await supabase
         .from('payments')
-        .select('id, receipt_file_path')
+        .select(`
+          id,
+          receipt_file_path
+        `)
         .eq('id', paymentId)
         .maybeSingle()
 
@@ -998,22 +1660,6 @@ router.get(
           error: 'Comprovante não encontrado.'
         })
       }
-
-      const { data: file, error: downloadError } = await supabase.storage
-        .from(RECEIPT_BUCKET)
-        .download(payment.receipt_file_path)
-
-      if (downloadError) throw downloadError
-
-      if (!file) {
-        return res.status(404).json({
-          error: 'Arquivo do comprovante não encontrado.'
-        })
-      }
-
-      const buffer = Buffer.from(
-        await file.arrayBuffer()
-      )
 
       const extension = path.extname(
         payment.receipt_file_path
@@ -1034,18 +1680,55 @@ router.get(
         })
       }
 
-      res.setHeader('Content-Type', contentType)
+      const {
+        data: file,
+        error: downloadError
+      } = await supabase.storage
+        .from(RECEIPT_BUCKET)
+        .download(payment.receipt_file_path)
+
+      if (downloadError) throw downloadError
+
+      if (!file) {
+        return res.status(404).json({
+          error: 'Arquivo do comprovante não encontrado.'
+        })
+      }
+
+      const buffer = Buffer.from(
+        await file.arrayBuffer()
+      )
+
+      res.setHeader(
+        'Content-Type',
+        contentType
+      )
+
       res.setHeader(
         'Content-Disposition',
         `attachment; filename="comprovante-${payment.id}${extension}"`
       )
-      res.setHeader('Content-Length', buffer.length)
+
+      res.setHeader(
+        'Content-Length',
+        buffer.length
+      )
+
+      res.setHeader(
+        'Cache-Control',
+        'private, no-store'
+      )
+
+      res.setHeader(
+        'X-Content-Type-Options',
+        'nosniff'
+      )
 
       return res.send(buffer)
     } catch (error) {
-      console.error(
-        '[FOODCORE] Erro ao baixar comprovante:',
-        error.message
+      logServerError(
+        'Erro ao baixar comprovante',
+        error
       )
 
       return res.status(500).json({
@@ -1064,7 +1747,9 @@ router.patch(
   requireAdmin,
   async (req, res) => {
     try {
-      if (!supabase) return databaseUnavailable(res)
+      if (!supabase) {
+        return databaseUnavailable(res)
+      }
 
       const paymentId = req.params.id
 
@@ -1088,7 +1773,10 @@ router.patch(
         })
       }
 
-      if (decision === 'reject' && reason.length < 5) {
+      if (
+        decision === 'reject' &&
+        reason.length < 5
+      ) {
         return res.status(400).json({
           error: 'Informe uma justificativa para rejeitar o pagamento.'
         })
@@ -1100,8 +1788,14 @@ router.patch(
         })
       }
 
-      // Busca o pagamento.
-      const { data: payment, error: paymentFindError } = await supabase
+      // -------------------------------------------------
+      // LOCALIZA PAGAMENTO
+      // -------------------------------------------------
+
+      const {
+        data: payment,
+        error: paymentFindError
+      } = await supabase
         .from('payments')
         .select(`
           id,
@@ -1113,7 +1807,9 @@ router.patch(
         .eq('id', paymentId)
         .maybeSingle()
 
-      if (paymentFindError) throw paymentFindError
+      if (paymentFindError) {
+        throw paymentFindError
+      }
 
       if (!payment) {
         return res.status(404).json({
@@ -1121,30 +1817,32 @@ router.patch(
         })
       }
 
-      if (!['pending', 'under_review'].includes(payment.status)) {
+      if (
+        !['pending', 'under_review'].includes(
+          payment.status
+        )
+      ) {
         return res.status(409).json({
           error: 'Este pagamento já foi analisado.'
         })
       }
 
-      // Busca a assinatura.
-      const { data: subscription, error: subscriptionError } =
-        await supabase
-          .from('subscriptions')
-          .select(`
-            id,
-            company_id,
-            contract_id,
-            monthly_price,
-            billing_day,
-            next_due_date,
-            grace_days,
-            status
-          `)
-          .eq('id', payment.subscription_id)
-          .maybeSingle()
+      // -------------------------------------------------
+      // LOCALIZA ASSINATURA
+      // -------------------------------------------------
 
-      if (subscriptionError) throw subscriptionError
+      const {
+        data: subscription,
+        error: subscriptionError
+      } = await supabase
+        .from('subscriptions')
+        .select(SUBSCRIPTION_SELECT)
+        .eq('id', payment.subscription_id)
+        .maybeSingle()
+
+      if (subscriptionError) {
+        throw subscriptionError
+      }
 
       if (!subscription) {
         return res.status(404).json({
@@ -1159,27 +1857,32 @@ router.patch(
       // -------------------------------------------------
 
       if (decision === 'reject') {
-        const { data: rejectedPayment, error: rejectError } =
-          await supabase
-            .from('payments')
-            .update({
-              status: 'rejected',
-              rejection_reason: reason,
-              reviewed_by: null,
-              reviewed_at: timestamp
-            })
-            .eq('id', paymentId)
-            .in('status', ['pending', 'under_review'])
-            .select(`
-              id,
-              subscription_id,
-              amount,
-              due_date,
-              status,
-              rejection_reason,
-              reviewed_at
-            `)
-            .maybeSingle()
+        const {
+          data: rejectedPayment,
+          error: rejectError
+        } = await supabase
+          .from('payments')
+          .update({
+            status: 'rejected',
+            rejection_reason: reason,
+            reviewed_by: null,
+            reviewed_at: timestamp
+          })
+          .eq('id', paymentId)
+          .in('status', [
+            'pending',
+            'under_review'
+          ])
+          .select(`
+            id,
+            subscription_id,
+            amount,
+            due_date,
+            status,
+            rejection_reason,
+            reviewed_at
+          `)
+          .maybeSingle()
 
         if (rejectError) throw rejectError
 
@@ -1189,10 +1892,25 @@ router.patch(
           })
         }
 
+        // Somente devolve para aguardando pagamento
+        // se o cadastro ainda estiver na primeira análise.
+        // Não altera o status de empresas já ativas.
+        const { error: companyUpdateError } = await supabase
+          .from('companies')
+          .update({
+            registration_status: 'awaiting_payment'
+          })
+          .eq('id', subscription.company_id)
+          .eq('registration_status', 'payment_under_review')
+
+        if (companyUpdateError) {
+          throw companyUpdateError
+        }
+
         await registerAdminLog({
           companyId: subscription.company_id,
           action: 'payment_rejected',
-          adminEmail: req.admin?.email,
+          adminEmail: getAdminEmail(req),
           details: {
             payment_id: payment.id,
             subscription_id: subscription.id,
@@ -1203,7 +1921,7 @@ router.patch(
 
         return res.json({
           success: true,
-          message: 'Pagamento rejeitado.',
+          message: 'Pagamento rejeitado. O cliente poderá enviar outro comprovante.',
           payment: rejectedPayment
         })
       }
@@ -1218,7 +1936,11 @@ router.patch(
         })
       }
 
-      const billingDay = Number(subscription.billing_day)
+      parseDateUTC(payment.due_date)
+
+      const billingDay = Number(
+        subscription.billing_day
+      )
 
       if (
         !Number.isInteger(billingDay) ||
@@ -1262,66 +1984,62 @@ router.patch(
       // LOCALIZA LICENÇA EXISTENTE
       // -------------------------------------------------
 
-      const { data: existingLicenses, error: licenseFindError } =
-        await supabase
-          .from('licenses')
-          .select(`
-            id,
-            company_id,
-            subscription_id,
-            license_key,
-            status,
-            activated_at,
-            expires_at
-          `)
-          .eq('subscription_id', subscription.id)
-          .neq('status', 'cancelled')
-          .limit(1)
+      const {
+        data: existingLicenses,
+        error: licenseFindError
+      } = await supabase
+        .from('licenses')
+        .select(LICENSE_SELECT)
+        .eq('subscription_id', subscription.id)
+        .neq('status', 'cancelled')
+        .order('activated_at', {
+          ascending: true
+        })
+        .limit(1)
 
-      if (licenseFindError) throw licenseFindError
+      if (licenseFindError) {
+        throw licenseFindError
+      }
 
-      const existingLicense = existingLicenses?.[0] || null
+      const existingLicense =
+        existingLicenses?.[0] || null
 
       // -------------------------------------------------
       // ATUALIZA ASSINATURA
       // -------------------------------------------------
 
-      const { data: updatedSubscription, error: updateSubscriptionError } =
-        await supabase
-          .from('subscriptions')
-          .update({
-            status: 'active',
-            next_due_date: nextDueDate
-          })
-          .eq('id', subscription.id)
-          .select(`
-            id,
-            company_id,
-            contract_id,
-            monthly_price,
-            billing_day,
-            next_due_date,
-            grace_days,
-            status
-          `)
-          .single()
+      const {
+        data: updatedSubscription,
+        error: updateSubscriptionError
+      } = await supabase
+        .from('subscriptions')
+        .update({
+          status: 'active',
+          next_due_date: nextDueDate
+        })
+        .eq('id', subscription.id)
+        .select(SUBSCRIPTION_SELECT)
+        .single()
 
       if (updateSubscriptionError) {
         throw updateSubscriptionError
       }
 
       // -------------------------------------------------
-      // ATIVA EMPRESA
+      // ATIVA EMPRESA E CADASTRO
       // -------------------------------------------------
 
       const { error: companyError } = await supabase
         .from('companies')
         .update({
-          status: 'active'
+          status: 'active',
+          registration_status: 'active'
         })
         .eq('id', subscription.company_id)
 
-      if (companyError) throw companyError
+      if (companyError) {
+        throw companyError
+      }
 
       // -------------------------------------------------
       // CRIA OU REATIVA LICENÇA
@@ -1330,87 +2048,94 @@ router.patch(
       let license
 
       if (existingLicense) {
-        const licenseUpdate = {
-          status: 'active',
-          expires_at: expiresAt
+        const {
+          data: updatedLicense,
+          error: licenseUpdateError
+        } = await supabase
+          .from('licenses')
+          .update({
+            status: 'active',
+            expires_at: expiresAt
+          })
+          .eq('id', existingLicense.id)
+          .select(LICENSE_SELECT)
+          .single()
+
+        if (licenseUpdateError) {
+          throw licenseUpdateError
         }
-
-        if (!existingLicense.activated_at) {
-          licenseUpdate.activated_at = timestamp
-        }
-
-        const { data: updatedLicense, error: licenseUpdateError } =
-          await supabase
-            .from('licenses')
-            .update(licenseUpdate)
-            .eq('id', existingLicense.id)
-            .select(`
-              id,
-              company_id,
-              subscription_id,
-              license_key,
-              status,
-              activated_at,
-              expires_at
-            `)
-            .single()
-
-        if (licenseUpdateError) throw licenseUpdateError
 
         license = updatedLicense
       } else {
-        const { data: newLicense, error: licenseInsertError } =
-          await supabase
+        const {
+          data: newLicense,
+          error: licenseInsertError
+        } = await supabase
+          .from('licenses')
+          .insert({
+            company_id: subscription.company_id,
+            subscription_id: subscription.id,
+            status: 'active',
+            activated_at: null,
+            expires_at: expiresAt
+          })
+          .select(LICENSE_SELECT)
+          .single()
+
+        if (licenseInsertError) {
+          const {
+            data: retryLicenses,
+            error: retryError
+          } = await supabase
             .from('licenses')
-            .insert({
-              company_id: subscription.company_id,
-              subscription_id: subscription.id,
-              status: 'active',
-              activated_at: timestamp,
-              expires_at: expiresAt
-            })
-            .select(`
-              id,
-              company_id,
-              subscription_id,
-              license_key,
-              status,
-              activated_at,
-              expires_at
-            `)
-            .single()
+            .select(LICENSE_SELECT)
+            .eq('subscription_id', subscription.id)
+            .neq('status', 'cancelled')
+            .limit(1)
 
-        if (licenseInsertError) throw licenseInsertError
+          if (retryError) throw retryError
 
-        license = newLicense
+          if (!retryLicenses?.length) {
+            throw licenseInsertError
+          }
+
+          license = retryLicenses[0]
+        } else {
+          license = newLicense
+        }
       }
 
       // -------------------------------------------------
       // CONFIRMA PAGAMENTO
       // -------------------------------------------------
 
-      const { data: confirmedPayment, error: confirmError } =
-        await supabase
-          .from('payments')
-          .update({
-            status: 'confirmed',
-            payment_date: timestamp,
-            reviewed_by: null,
-            reviewed_at: timestamp,
-            rejection_reason: null
-          })
-          .eq('id', paymentId)
-          .in('status', ['pending', 'under_review'])
-          .select(`
-            id,
-            subscription_id,
-            amount,
-            due_date,
-            payment_date,
-            status,
-            reviewed_at
-          `)
-          .maybeSingle()
+      const {
+        data: confirmedPayment,
+        error: confirmError
+      } = await supabase
+        .from('payments')
+        .update({
+          status: 'confirmed',
+          payment_date: timestamp,
+          reviewed_by: null,
+          reviewed_at: timestamp,
+          rejection_reason: null
+        })
+        .eq('id', paymentId)
+        .in('status', [
+          'pending',
+          'under_review'
+        ])
+        .select(`
+          id,
+          subscription_id,
+          amount,
+          due_date,
+          payment_date,
+          status,
+          reviewed_at
+        `)
+        .maybeSingle()
 
       if (confirmError) throw confirmError
 
@@ -1421,17 +2146,13 @@ router.patch(
       }
 
       // -------------------------------------------------
-      // PREPARA A PRÓXIMA COBRANÇA
+      // CRIA PRÓXIMA COBRANÇA
       // -------------------------------------------------
 
-      const nextSubscription = {
+      const nextPayment = await ensurePaymentForSubscription({
         ...updatedSubscription,
         next_due_date: nextDueDate
-      }
-
-      const nextPayment = await ensurePaymentForSubscription(
-        nextSubscription
-      )
+      })
 
       // -------------------------------------------------
       // AUDITORIA
@@ -1440,7 +2161,7 @@ router.patch(
       await registerAdminLog({
         companyId: subscription.company_id,
         action: 'payment_confirmed',
-        adminEmail: req.admin?.email,
+        adminEmail: getAdminEmail(req),
         details: {
           payment_id: payment.id,
           subscription_id: subscription.id,
@@ -1451,6 +2172,10 @@ router.patch(
           expires_at: expiresAt
         }
       })
+
+      // -------------------------------------------------
+      // RESPOSTA
+      // -------------------------------------------------
 
       return res.json({
         success: true,
@@ -1467,18 +2192,18 @@ router.patch(
           id: license.id,
           license_key: license.license_key,
           status: license.status,
+          activated_at: license.activated_at,
           expires_at: license.expires_at
         }
       })
     } catch (error) {
-      console.error(
-        '[FOODCORE] Erro ao processar decisão do pagamento:',
-        error.message
+      logServerError(
+        'Erro ao processar decisão do pagamento',
+        error
       )
 
       return res.status(500).json({
-        error: 'Não foi possível concluir a análise do pagamento.',
-        details: error.message
+        error: 'Não foi possível concluir a análise do pagamento.'
       })
     }
   }
@@ -1492,8 +2217,13 @@ router.get('/releases', requireAdmin, async (_req, res) => {
   try {
     const db = await readStore()
 
-    const releases = [...db.releases]
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    const releases = [
+      ...(db.releases || [])
+    ]
+      .sort((a, b) => (
+        new Date(b.createdAt).getTime() -
+        new Date(a.createdAt).getTime()
+      ))
       .map(({ storageName, ...release }) => release)
 
     return res.json({
@@ -1501,9 +2231,9 @@ router.get('/releases', requireAdmin, async (_req, res) => {
       releases
     })
   } catch (error) {
-    console.error(
-      '[FOODCORE] Erro ao listar versões:',
-      error.message
+    logServerError(
+      'Erro ao listar versões',
+      error
     )
 
     return res.status(500).json({
@@ -1532,7 +2262,9 @@ router.post(
         req.body?.version || ''
       ).trim()
 
-      if (!/^\d+\.\d+\.\d+([+-][\w.-]+)?$/.test(version)) {
+      if (
+        !/^\d+\.\d+\.\d+([+-][\w.-]+)?$/.test(version)
+      ) {
         await removeUploadedFile(req.file)
 
         return res.status(400).json({
@@ -1540,7 +2272,23 @@ router.post(
         })
       }
 
+      const isValidExecutable = await validateExecutableFile(
+        req.file.path
+      )
+
+      if (!isValidExecutable) {
+        await removeUploadedFile(req.file)
+
+        return res.status(400).json({
+          error: 'O arquivo enviado não parece ser um executável Windows válido.'
+        })
+      }
+
       const db = await readStore()
+
+      db.releases = Array.isArray(db.releases)
+        ? db.releases
+        : []
 
       const versionExists = db.releases.some(
         release => release.version === version
@@ -1562,8 +2310,12 @@ router.post(
         id: crypto.randomUUID(),
         version,
         sha256,
-        notes: String(req.body?.notes || '').slice(0, 5000),
-        originalName: req.file.originalname,
+        notes: String(
+          req.body?.notes || ''
+        ).slice(0, 5000),
+        originalName: getSafeFilename(
+          req.file.originalname
+        ),
         storageName: req.file.filename,
         sizeBytes: req.file.size,
         createdAt: new Date().toISOString(),
@@ -1586,9 +2338,9 @@ router.post(
     } catch (error) {
       await removeUploadedFile(req.file)
 
-      console.error(
-        '[FOODCORE] Erro ao publicar versão:',
-        error.message
+      logServerError(
+        'Erro ao publicar versão',
+        error
       )
 
       return res.status(500).json({
@@ -1597,6 +2349,44 @@ router.post(
     }
   }
 )
+
+// =====================================================
+// TRATAMENTO DE ERROS DO MULTER
+// =====================================================
+
+router.use((error, _req, res, next) => {
+  if (!error) {
+    return next()
+  }
+
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({
+        error: `O arquivo ultrapassa o limite de ${MAX_UPLOAD_MB} MB.`
+      })
+    }
+
+    if (error.code === 'LIMIT_FILE_COUNT') {
+      return res.status(400).json({
+        error: 'Envie somente um arquivo por vez.'
+      })
+    }
+
+    return res.status(400).json({
+      error: 'Não foi possível processar o arquivo enviado.'
+    })
+  }
+
+  if (
+    error.message === 'Envie somente arquivos .exe.'
+  ) {
+    return res.status(400).json({
+      error: error.message
+    })
+  }
+
+  return next(error)
+})
 
 // =====================================================
 // EXPORTAÇÃO
