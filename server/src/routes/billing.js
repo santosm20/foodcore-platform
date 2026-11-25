@@ -3,7 +3,6 @@ import { Router } from 'express'
 import crypto from 'node:crypto'
 import multer from 'multer'
 
-import { createCheckout } from '../services/pagbank.js'
 import { readStore, writeStore } from '../store.js'
 import { supabase } from '../supabase.js'
 import { requireCustomer } from '../middleware/customerAuth.js'
@@ -23,26 +22,48 @@ const ALLOWED_RECEIPT_TYPES = {
   'image/png': 'png'
 }
 
+const ALLOWED_SUBSCRIPTION_STATUSES = [
+  'pending',
+  'active',
+  'past_due',
+  'suspended'
+]
+
 // =====================================================
-// PLANOS LEGADOS - PAGBANK
+// VALIDAÇÃO DO ARQUIVO
 // =====================================================
 
-const plans = {
-  starter: {
-    id: 'starter',
-    name: 'FOODCORE Essencial',
-    amountCents: 9900,
-    interval: 'MONTHLY',
-    billingCycles: 0
-  },
-
-  pro: {
-    id: 'pro',
-    name: 'FOODCORE Profissional',
-    amountCents: 14900,
-    interval: 'MONTHLY',
-    billingCycles: 0
+function validateFileSignature(buffer, mimetype) {
+  if (!Buffer.isBuffer(buffer)) {
+    return false
   }
+
+  if (mimetype === 'application/pdf') {
+    return buffer.subarray(0, 5).toString() === '%PDF-'
+  }
+
+  if (mimetype === 'image/jpeg') {
+    return (
+      buffer.length >= 3 &&
+      buffer[0] === 0xff &&
+      buffer[1] === 0xd8 &&
+      buffer[2] === 0xff
+    )
+  }
+
+  if (mimetype === 'image/png') {
+    return (
+      buffer.length >= 8 &&
+      buffer.subarray(0, 8).equals(
+        Buffer.from([
+          0x89, 0x50, 0x4e, 0x47,
+          0x0d, 0x0a, 0x1a, 0x0a
+        ])
+      )
+    )
+  }
+
+  return false
 }
 
 // =====================================================
@@ -68,6 +89,28 @@ const receiptUpload = multer({
   }
 })
 
+function handleReceiptUpload(req, res, next) {
+  receiptUpload.single('receipt')(req, res, error => {
+    if (!error) {
+      return next()
+    }
+
+    if (error instanceof multer.MulterError) {
+      const isTooLarge = error.code === 'LIMIT_FILE_SIZE'
+
+      return res.status(isTooLarge ? 413 : 400).json({
+        error: isTooLarge
+          ? 'O comprovante ultrapassa o limite de 10 MB.'
+          : 'Não foi possível receber o comprovante.'
+      })
+    }
+
+    return res.status(400).json({
+      error: error.message || 'Arquivo inválido.'
+    })
+  })
+}
+
 // =====================================================
 // FUNÇÕES AUXILIARES
 // =====================================================
@@ -78,10 +121,6 @@ function databaseUnavailable(res) {
   })
 }
 
-function getFileExtension(mimetype) {
-  return ALLOWED_RECEIPT_TYPES[mimetype] || null
-}
-
 function getCustomerCompanyId(req) {
   return req.customer?.companyId || null
 }
@@ -90,8 +129,20 @@ function validPaymentMethod(method) {
   return ['pix', 'bank_transfer'].includes(method)
 }
 
+function getFileExtension(mimetype) {
+  return ALLOWED_RECEIPT_TYPES[mimetype] || null
+}
+
+function createHttpError(message, statusCode = 500) {
+  const error = new Error(message)
+  error.statusCode = statusCode
+  return error
+}
+
 async function removeStorageFile(filePath) {
-  if (!supabase || !filePath) return
+  if (!supabase || !filePath) {
+    return
+  }
 
   const { error } = await supabase.storage
     .from(RECEIPT_BUCKET)
@@ -105,22 +156,69 @@ async function removeStorageFile(filePath) {
   }
 }
 
-// =====================================================
-// ENVIO DE COMPROVANTE DE PAGAMENTO
-// =====================================================
+/**
+ * Restaura a cobrança caso a atualização do cadastro
+ * da empresa falhe depois do registro do comprovante.
+ */
+async function rollbackPayment(paymentId, existingPayment) {
+  if (!paymentId) {
+    return
+  }
 
+  if (existingPayment) {
+    const { error } = await supabase
+      .from('payments')
+      .update({
+        amount: existingPayment.amount,
+        payment_method: existingPayment.payment_method,
+        receipt_file_path: existingPayment.receipt_file_path,
+        status: existingPayment.status,
+        rejection_reason: existingPayment.rejection_reason,
+        reviewed_by: existingPayment.reviewed_by,
+        reviewed_at: existingPayment.reviewed_at,
+        payment_date: existingPayment.payment_date
+      })
+      .eq('id', paymentId)
+      .eq('status', 'under_review')
+
+    if (error) {
+      console.error(
+        '[FOODCORE] Erro ao restaurar cobrança:',
+        error.message
+      )
+    }
+
+    return
+  }
+
+  const { error } = await supabase
+    .from('payments')
+    .delete()
+    .eq('id', paymentId)
+    .eq('status', 'under_review')
+
+  if (error) {
+    console.error(
+      '[FOODCORE] Erro ao remover cobrança não confirmada:',
+      error.message
+    )
+  }
+}
+
+// =====================================================
+// ENVIO DE COMPROVANTE
 // POST /api/billing/receipt
-//
-// FormData:
-// - receipt: arquivo PDF, JPG ou PNG
-// - payment_method: pix ou bank_transfer
+// =====================================================
 
 router.post(
   '/receipt',
   requireCustomer,
-  receiptUpload.single('receipt'),
+  handleReceiptUpload,
   async (req, res) => {
     let uploadedFilePath = null
+    let paymentId = null
+    let paymentSaved = false
+    let existingPayment = null
 
     try {
       if (!supabase) {
@@ -138,6 +236,27 @@ router.post(
       if (!req.file) {
         return res.status(400).json({
           error: 'Envie o comprovante de pagamento.'
+        })
+      }
+
+      const registrationStatus = req.customer.registrationStatus
+      const companyStatus = req.customer.companyStatus
+
+      // -------------------------------------------------
+      // VALIDAR ETAPA DO CADASTRO
+      // -------------------------------------------------
+
+      if (companyStatus === 'suspended') {
+        return res.status(403).json({
+          error: 'Sua empresa está suspensa. Entre em contato com o suporte.'
+        })
+      }
+
+      if (
+        !['awaiting_payment', 'active'].includes(registrationStatus)
+      ) {
+        return res.status(409).json({
+          error: 'Sua empresa não possui uma cobrança disponível para envio de comprovante.'
         })
       }
 
@@ -159,28 +278,37 @@ router.post(
         })
       }
 
-      // -----------------------------------------------
-      // LOCALIZA A ASSINATURA DA EMPRESA
-      // -----------------------------------------------
+      if (!validateFileSignature(req.file.buffer, req.file.mimetype)) {
+        return res.status(400).json({
+          error: 'O conteúdo do arquivo não corresponde ao formato informado.'
+        })
+      }
 
-      const { data: subscriptions, error: subscriptionError } =
-        await supabase
-          .from('subscriptions')
-          .select(`
-            id,
-            company_id,
-            monthly_price,
-            next_due_date,
-            status
-          `)
-          .eq('company_id', companyId)
-          .in('status', ['pending', 'active', 'past_due'])
-          .order('created_at', { ascending: false })
-          .limit(1)
+      // -------------------------------------------------
+      // LOCALIZAR ASSINATURA
+      // -------------------------------------------------
 
-      if (subscriptionError) throw subscriptionError
+      const {
+        data: subscription,
+        error: subscriptionError
+      } = await supabase
+        .from('subscriptions')
+        .select(`
+          id,
+          company_id,
+          monthly_price,
+          next_due_date,
+          status
+        `)
+        .eq('company_id', companyId)
+        .in('status', ALLOWED_SUBSCRIPTION_STATUSES)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
 
-      const subscription = subscriptions?.[0]
+      if (subscriptionError) {
+        throw subscriptionError
+      }
 
       if (!subscription) {
         return res.status(404).json({
@@ -194,41 +322,96 @@ router.post(
         })
       }
 
-      // -----------------------------------------------
-      // EVITA DUPLICIDADE DE PAGAMENTO
-      // -----------------------------------------------
+      const amount = Number(subscription.monthly_price)
 
-      const { data: existingPayments, error: paymentFindError } =
-        await supabase
-          .from('payments')
-          .select('id, status')
-          .eq('subscription_id', subscription.id)
-          .eq('due_date', subscription.next_due_date)
-          .in('status', ['pending', 'under_review', 'confirmed'])
-          .limit(1)
-
-      if (paymentFindError) throw paymentFindError
-
-      if (existingPayments?.length) {
+      if (!Number.isFinite(amount) || amount <= 0) {
         return res.status(409).json({
-          error: 'Já existe um pagamento registrado para este vencimento.',
-          payment_status: existingPayments[0].status
+          error: 'O valor da assinatura está inválido. Entre em contato com o suporte.'
         })
       }
 
-      // -----------------------------------------------
-      // ENVIA ARQUIVO PARA O SUPABASE STORAGE
-      // -----------------------------------------------
+      // -------------------------------------------------
+      // LOCALIZAR COBRANÇA EXISTENTE
+      // -------------------------------------------------
 
-      const paymentId = crypto.randomUUID()
+      const {
+        data: foundPayment,
+        error: paymentFindError
+      } = await supabase
+        .from('payments')
+        .select(`
+          id,
+          subscription_id,
+          amount,
+          due_date,
+          payment_method,
+          receipt_file_path,
+          status,
+          rejection_reason,
+          reviewed_by,
+          reviewed_at,
+          payment_date
+        `)
+        .eq('subscription_id', subscription.id)
+        .eq('due_date', subscription.next_due_date)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+
+      if (paymentFindError) {
+        throw paymentFindError
+      }
+
+      existingPayment = foundPayment
+
+      // -------------------------------------------------
+      // VERIFICAR SITUAÇÃO DA COBRANÇA
+      // -------------------------------------------------
+
+      if (existingPayment) {
+        if (existingPayment.status === 'confirmed') {
+          return res.status(409).json({
+            error: 'Este vencimento já foi pago.'
+          })
+        }
+
+        if (existingPayment.status === 'under_review') {
+          return res.status(409).json({
+            error: 'Seu comprovante já está em análise administrativa.'
+          })
+        }
+
+        if (
+          existingPayment.status === 'pending' &&
+          existingPayment.receipt_file_path
+        ) {
+          return res.status(409).json({
+            error: 'Já existe um comprovante enviado para esta cobrança.'
+          })
+        }
+
+        if (!['pending', 'rejected'].includes(existingPayment.status)) {
+          return res.status(409).json({
+            error: 'Esta cobrança não permite o envio de comprovantes.'
+          })
+        }
+      }
+
+      // -------------------------------------------------
+      // ENVIAR ARQUIVO AO STORAGE
+      // -------------------------------------------------
+
+      paymentId = existingPayment?.id || crypto.randomUUID()
 
       uploadedFilePath = [
         companyId,
         subscription.id,
-        `${paymentId}.${extension}`
+        `${crypto.randomUUID()}.${extension}`
       ].join('/')
 
-      const { error: storageError } = await supabase.storage
+      const {
+        error: storageError
+      } = await supabase.storage
         .from(RECEIPT_BUCKET)
         .upload(
           uploadedFilePath,
@@ -240,36 +423,123 @@ router.post(
           }
         )
 
-      if (storageError) throw storageError
+      if (storageError) {
+        throw storageError
+      }
 
-      // -----------------------------------------------
-      // REGISTRA PAGAMENTO NO BANCO
-      // -----------------------------------------------
+      // -------------------------------------------------
+      // REGISTRAR COMPROVANTE
+      // -------------------------------------------------
 
-      const { data: payment, error: insertError } = await supabase
-        .from('payments')
-        .insert({
-          id: paymentId,
-          subscription_id: subscription.id,
-          amount: subscription.monthly_price,
-          due_date: subscription.next_due_date,
-          payment_method: paymentMethod,
-          receipt_file_path: uploadedFilePath,
-          status: 'pending'
-        })
-        .select(`
-          id,
-          subscription_id,
-          amount,
-          due_date,
-          payment_method,
-          status,
-          created_at
-        `)
-        .single()
+      let payment
 
-      if (insertError) throw insertError
+      if (existingPayment) {
+        const {
+          data,
+          error: updateError
+        } = await supabase
+          .from('payments')
+          .update({
+            amount,
+            payment_method: paymentMethod,
+            receipt_file_path: uploadedFilePath,
+            status: 'under_review',
+            rejection_reason: null,
+            reviewed_by: null,
+            reviewed_at: null,
+            payment_date: null
+          })
+          .eq('id', existingPayment.id)
+          .in('status', ['pending', 'rejected'])
+          .select(`
+            id,
+            subscription_id,
+            amount,
+            due_date,
+            payment_method,
+            status,
+            created_at
+          `)
+          .maybeSingle()
 
+        if (updateError) {
+          throw updateError
+        }
+
+        if (!data) {
+          throw createHttpError(
+            'A cobrança foi alterada por outra operação. Atualize a página e tente novamente.',
+            409
+          )
+        }
+
+        payment = data
+      } else {
+        const {
+          data,
+          error: insertError
+        } = await supabase
+          .from('payments')
+          .insert({
+            id: paymentId,
+            subscription_id: subscription.id,
+            amount,
+            due_date: subscription.next_due_date,
+            payment_method: paymentMethod,
+            receipt_file_path: uploadedFilePath,
+            status: 'under_review'
+          })
+          .select(`
+            id,
+            subscription_id,
+            amount,
+            due_date,
+            payment_method,
+            status,
+            created_at
+          `)
+          .single()
+
+        if (insertError) {
+          throw insertError
+        }
+
+        payment = data
+      }
+
+      paymentSaved = true
+
+      // -------------------------------------------------
+      // ATUALIZAR CADASTRO PARA ANÁLISE
+      // -------------------------------------------------
+
+      if (registrationStatus === 'awaiting_payment') {
+        const {
+          data: updatedCompany,
+          error: companyUpdateError
+        } = await supabase
+          .from('companies')
+          .update({
+            registration_status: 'payment_under_review'
+          })
+          .eq('id', companyId)
+          .eq('registration_status', 'awaiting_payment')
+          .select('id')
+          .maybeSingle()
+
+        if (companyUpdateError) {
+          throw companyUpdateError
+        }
+
+        if (!updatedCompany) {
+          throw createHttpError(
+            'O cadastro foi alterado durante o envio. Atualize a página e tente novamente.',
+            409
+          )
+        }
+      }
+
+      // O arquivo e a cobrança foram registrados com sucesso.
       uploadedFilePath = null
 
       return res.status(201).json({
@@ -279,80 +549,47 @@ router.post(
       })
 
     } catch (error) {
+      // -------------------------------------------------
+      // REVERSÃO EM CASO DE FALHA
+      // -------------------------------------------------
+
+      if (paymentSaved) {
+        await rollbackPayment(paymentId, existingPayment)
+      }
+
       if (uploadedFilePath) {
         await removeStorageFile(uploadedFilePath)
       }
 
       console.error(
         '[FOODCORE] Erro ao enviar comprovante:',
-        error.message
+        error?.message || error
       )
 
-      return res.status(500).json({
-        error: 'Não foi possível registrar o comprovante.'
+      return res.status(error.statusCode || 500).json({
+        error: error.statusCode
+          ? error.message
+          : 'Não foi possível registrar o comprovante.'
       })
     }
   }
 )
 
 // =====================================================
-// CHECKOUT PAGBANK - COMPATIBILIDADE LEGADA
+// CHECKOUT PAGBANK LEGADO
+// POST /api/billing/checkout
 // =====================================================
 
-router.post('/checkout', async (req, res) => {
-  try {
-    const {
-      planId,
-      method,
-      recurring = false,
-      customer
-    } = req.body || {}
-
-    const plan = plans[planId]
-
-    if (!plan) {
-      return res.status(400).json({
-        error: 'Plano inválido.'
-      })
-    }
-
-    if (!['pix', 'card'].includes(method)) {
-      return res.status(400).json({
-        error: 'Método deve ser pix ou card.'
-      })
-    }
-
-    if (!customer?.name || !customer?.email) {
-      return res.status(400).json({
-        error: 'Informe nome e e-mail do cliente.'
-      })
-    }
-
-    const checkout = await createCheckout({
-      plan,
-      customer,
-      method,
-      recurring: Boolean(recurring)
-    })
-
-    return res.status(201).json({
-      checkout
-    })
-
-  } catch (error) {
-    console.error(
-      '[FOODCORE] Erro ao criar checkout PagBank:',
-      error.message
-    )
-
-    return res.status(error.status || 500).json({
-      error: error.message || 'Não foi possível criar o checkout.'
-    })
-  }
+router.post('/checkout', (_req, res) => {
+  return res.status(410).json({
+    error: 'Checkout automático indisponível.',
+    message: 'A FOODCORE utiliza pagamento via PIX ou transferência, com aprovação administrativa.'
+  })
 })
 
 // =====================================================
-// WEBHOOK PAGBANK - REGISTRO NÃO PROCESSADO
+// WEBHOOK PAGBANK LEGADO
+// POST /api/billing/webhook
 // =====================================================
 
 router.post('/webhook', async (req, res) => {
@@ -383,7 +620,7 @@ router.post('/webhook', async (req, res) => {
   } catch (error) {
     console.error(
       '[FOODCORE] Erro ao registrar webhook PagBank:',
-      error.message
+      error?.message || error
     )
 
     return res.status(500).json({

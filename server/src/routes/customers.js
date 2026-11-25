@@ -1,17 +1,25 @@
 
 import { Router } from 'express'
 import rateLimit from 'express-rate-limit'
+
 import {
   supabase,
   supabaseAuth
 } from '../supabase.js'
+
 import { requireCustomer } from '../middleware/customerAuth.js'
 
 const router = Router()
 
-// Limita tentativas de cadastro e login.
+// =====================================================
+// CONFIGURAÇÕES
+// =====================================================
+
+const REGISTER_WINDOW_MS = 15 * 60 * 1000
+const LOGIN_WINDOW_MS = 15 * 60 * 1000
+
 const registerLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
+  windowMs: REGISTER_WINDOW_MS,
   limit: 5,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
@@ -21,7 +29,7 @@ const registerLimiter = rateLimit({
 })
 
 const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
+  windowMs: LOGIN_WINDOW_MS,
   limit: 10,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
@@ -30,29 +38,32 @@ const loginLimiter = rateLimit({
   }
 })
 
-// Normaliza textos.
+// =====================================================
+// NORMALIZAÇÃO
+// =====================================================
+
 function clean(value) {
   return typeof value === 'string' ? value.trim() : ''
 }
 
-// Normaliza e-mail.
 function normalizeEmail(value) {
   return clean(value).toLowerCase()
 }
 
-// CPF: mantém somente números.
 function normalizeCpf(value) {
   return String(value || '').replace(/\D/g, '')
 }
 
-// CNPJ: permite números e letras.
 function normalizeCnpj(value) {
   return String(value || '')
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, '')
 }
 
-// Valida CPF.
+// =====================================================
+// VALIDAÇÃO DE CPF
+// =====================================================
+
 function isValidCpf(value) {
   const cpf = normalizeCpf(value)
 
@@ -66,8 +77,8 @@ function isValidCpf(value) {
   }
 
   let digit = (sum * 10) % 11
-  if (digit === 10) digit = 0
 
+  if (digit === 10) digit = 0
   if (digit !== Number(cpf[9])) return false
 
   sum = 0
@@ -77,13 +88,16 @@ function isValidCpf(value) {
   }
 
   digit = (sum * 10) % 11
+
   if (digit === 10) digit = 0
 
   return digit === Number(cpf[10])
 }
 
-// Converte os caracteres do CNPJ alfanumérico
-// para os valores utilizados no cálculo dos dígitos.
+// =====================================================
+// VALIDAÇÃO DE CNPJ
+// =====================================================
+
 function cnpjCharacterValue(character) {
   if (/[0-9]/.test(character)) {
     return Number(character)
@@ -92,7 +106,6 @@ function cnpjCharacterValue(character) {
   return character.charCodeAt(0) - 48
 }
 
-// Calcula um dígito verificador de CNPJ.
 function calculateCnpjDigit(base, weights) {
   const sum = base.reduce((total, character, index) => {
     return total + (
@@ -105,7 +118,6 @@ function calculateCnpjDigit(base, weights) {
   return remainder < 2 ? 0 : 11 - remainder
 }
 
-// Valida CNPJ numérico e alfanumérico.
 function isValidCnpj(value) {
   const cnpj = normalizeCnpj(value)
 
@@ -125,10 +137,10 @@ function isValidCnpj(value) {
     6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2
   ]
 
-  const base = cnpj.slice(0, 12)
+  const base = cnpj.slice(0, 12).split('')
 
   const firstDigit = calculateCnpjDigit(
-    base.split(''),
+    base,
     firstWeights
   )
 
@@ -137,19 +149,25 @@ function isValidCnpj(value) {
   }
 
   const secondDigit = calculateCnpjDigit(
-    [...base.split(''), String(firstDigit)],
+    [...base, String(firstDigit)],
     secondWeights
   )
 
   return secondDigit === Number(cnpj[13])
 }
 
-// Validação básica de e-mail.
+// =====================================================
+// VALIDAÇÃO DE E-MAIL
+// =====================================================
+
 function isValidEmail(value) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
 }
 
-// Verifica se o Supabase está configurado.
+// =====================================================
+// SUPABASE
+// =====================================================
+
 function checkSupabase(res) {
   if (!supabase || !supabaseAuth) {
     res.status(503).json({
@@ -162,7 +180,10 @@ function checkSupabase(res) {
   return true
 }
 
-// Converte erros de duplicidade em respostas amigáveis.
+// =====================================================
+// TRATAMENTO DE DUPLICIDADE
+// =====================================================
+
 function isDuplicateError(error) {
   const message = String(error?.message || '').toLowerCase()
 
@@ -174,15 +195,164 @@ function isDuplicateError(error) {
   )
 }
 
-// ==========================================
+// =====================================================
+// COMPENSAÇÃO DE CADASTRO
+// =====================================================
+
+async function rollbackRegistration({
+  authUserId,
+  companyId
+}) {
+  if (authUserId) {
+    const { error } = await supabase
+      .from('profiles')
+      .delete()
+      .eq('id', authUserId)
+
+    if (error) {
+      console.error(
+        '[FOODCORE] Falha ao remover perfil:',
+        error.message
+      )
+    }
+  }
+
+  if (companyId) {
+    const { error } = await supabase
+      .from('companies')
+      .delete()
+      .eq('id', companyId)
+
+    if (error) {
+      console.error(
+        '[FOODCORE] Falha ao remover empresa:',
+        error.message
+      )
+    }
+  }
+
+  if (authUserId) {
+    const { error } = await supabase.auth.admin.deleteUser(
+      authUserId
+    )
+
+    if (error) {
+      console.error(
+        '[FOODCORE] Falha ao remover usuário Auth:',
+        error.message
+      )
+    }
+  }
+}
+
+// =====================================================
+// FLUXO DE CADASTRO DO CLIENTE
+// =====================================================
+
+function getCustomerWorkflow(company) {
+  const companyStatus = String(
+    company?.status || ''
+  ).toLowerCase()
+
+  const registrationStatus = String(
+    company?.registration_status || 'pending_review'
+  ).toLowerCase()
+
+  if (companyStatus === 'suspended') {
+    return {
+      status: 'suspended',
+      message: 'Sua empresa está suspensa. Entre em contato com o suporte.',
+      canAccessPayment: false,
+      canUploadReceipt: false,
+      canDownload: false
+    }
+  }
+
+  if (
+    companyStatus === 'active' &&
+    registrationStatus === 'active'
+  ) {
+    return {
+      status: 'active',
+      message: 'Pagamento confirmado. Sua licença está ativa e o download está liberado.',
+      canAccessPayment: false,
+      canUploadReceipt: false,
+      canDownload: true
+    }
+  }
+
+  if (registrationStatus === 'awaiting_payment') {
+    return {
+      status: 'awaiting_payment',
+      message: 'Seu cadastro foi aprovado. Acesse o link de pagamento e envie o comprovante.',
+      canAccessPayment: true,
+      canUploadReceipt: true,
+      canDownload: false
+    }
+  }
+
+  if (registrationStatus === 'payment_under_review') {
+    return {
+      status: 'payment_under_review',
+      message: 'Seu comprovante foi recebido e está aguardando confirmação administrativa.',
+      canAccessPayment: true,
+      canUploadReceipt: false,
+      canDownload: false
+    }
+  }
+
+  if (registrationStatus === 'rejected') {
+    return {
+      status: 'rejected',
+      message: 'Seu cadastro não foi aprovado. Entre em contato com o suporte da FOODCORE.',
+      canAccessPayment: false,
+      canUploadReceipt: false,
+      canDownload: false
+    }
+  }
+
+  return {
+    status: 'pending_review',
+    message: 'Seu cadastro foi recebido e está aguardando análise da FOODCORE.',
+    canAccessPayment: false,
+    canUploadReceipt: false,
+    canDownload: false
+  }
+}
+
+// =====================================================
+// DADOS PÚBLICOS DA EMPRESA PARA O PRÓPRIO CLIENTE
+// =====================================================
+
+function serializeCompany(company) {
+  if (!company) return null
+
+  const workflow = getCustomerWorkflow(company)
+
+  return {
+    id: company.id,
+    legal_name: company.legal_name,
+    trade_name: company.trade_name,
+    cnpj: company.cnpj,
+    status: company.status,
+    registration_status: company.registration_status || 'pending_review',
+    payment_link: workflow.canAccessPayment
+      ? company.payment_link || null
+      : null,
+    created_at: company.created_at
+  }
+}
+
+// =====================================================
 // CADASTRO DE EMPRESA E CLIENTE
-// ==========================================
+// =====================================================
 
 router.post('/register', registerLimiter, async (req, res) => {
   if (!checkSupabase(res)) return
 
   let authUserId = null
   let companyId = null
+  let registrationCompleted = false
 
   try {
     const body = req.body || {}
@@ -191,22 +361,31 @@ router.post('/register', registerLimiter, async (req, res) => {
     const tradeName = clean(body.trade_name)
     const cnpj = normalizeCnpj(body.cnpj)
     const stateRegistration = clean(body.state_registration)
+
     const email = normalizeEmail(body.email)
     const phone = clean(body.phone)
-    const postalCode = clean(body.postal_code).replace(/\D/g, '')
+
+    const postalCode = clean(body.postal_code)
+      .replace(/\D/g, '')
+
     const street = clean(body.street)
     const number = clean(body.number)
     const complement = clean(body.complement)
     const neighborhood = clean(body.neighborhood)
     const city = clean(body.city)
     const state = clean(body.state).toUpperCase()
+
     const representativeName = clean(body.representative_name)
     const representativeCpf = normalizeCpf(body.representative_cpf)
+
     const password = typeof body.password === 'string'
       ? body.password
       : ''
 
-    // Campos obrigatórios.
+    // ---------------------------------------------
+    // CAMPOS OBRIGATÓRIOS
+    // ---------------------------------------------
+
     if (
       !legalName ||
       !cnpj ||
@@ -220,18 +399,32 @@ router.post('/register', registerLimiter, async (req, res) => {
       })
     }
 
-    // Limites de tamanho.
+    // ---------------------------------------------
+    // LIMITES DOS CAMPOS
+    // ---------------------------------------------
+
     if (
       legalName.length > 200 ||
       tradeName.length > 200 ||
       representativeName.length > 150 ||
       email.length > 254 ||
-      password.length > 128
+      password.length > 128 ||
+      phone.length > 30 ||
+      street.length > 200 ||
+      number.length > 30 ||
+      complement.length > 100 ||
+      neighborhood.length > 100 ||
+      city.length > 100 ||
+      stateRegistration.length > 30
     ) {
       return res.status(400).json({
         error: 'Um ou mais campos ultrapassaram o tamanho permitido.'
       })
     }
+
+    // ---------------------------------------------
+    // VALIDAÇÕES
+    // ---------------------------------------------
 
     if (!isValidEmail(email)) {
       return res.status(400).json({
@@ -269,11 +462,18 @@ router.post('/register', registerLimiter, async (req, res) => {
       })
     }
 
-    // Verifica se o CNPJ já está cadastrado.
-    const { data: existingCompany, error: searchError } = await supabase
+    // ---------------------------------------------
+    // VERIFICA SE O CNPJ JÁ EXISTE
+    // ---------------------------------------------
+
+    const {
+      data: existingCompany,
+      error: searchError
+    } = await supabase
       .from('companies')
       .select('id')
       .eq('cnpj', cnpj)
+      .limit(1)
       .maybeSingle()
 
     if (searchError) {
@@ -293,8 +493,10 @@ router.post('/register', registerLimiter, async (req, res) => {
       })
     }
 
-    // 1. Cria a conta no Supabase Auth.
-    // email_confirm: true permite login sem confirmação por e-mail.
+    // ---------------------------------------------
+    // 1. CRIA USUÁRIO NO SUPABASE AUTH
+    // ---------------------------------------------
+
     const {
       data: authData,
       error: authError
@@ -326,7 +528,10 @@ router.post('/register', registerLimiter, async (req, res) => {
 
     authUserId = authData.user.id
 
-    // 2. Cria a empresa.
+    // ---------------------------------------------
+    // 2. CADASTRA A EMPRESA
+    // ---------------------------------------------
+
     const companyData = {
       legal_name: legalName,
       trade_name: tradeName || null,
@@ -343,7 +548,15 @@ router.post('/register', registerLimiter, async (req, res) => {
       state: state || null,
       representative_name: representativeName,
       representative_cpf: representativeCpf,
-      status: 'pending'
+
+      // A empresa ainda não possui licença.
+      status: 'pending',
+
+      // Estado específico do novo fluxo comercial.
+      registration_status: 'pending_review',
+
+      // O link será inserido exclusivamente pelo administrador.
+      payment_link: null
     }
 
     const {
@@ -352,19 +565,35 @@ router.post('/register', registerLimiter, async (req, res) => {
     } = await supabase
       .from('companies')
       .insert(companyData)
-      .select('id, legal_name, trade_name, cnpj, status')
+      .select(`
+        id,
+        legal_name,
+        trade_name,
+        cnpj,
+        status,
+        registration_status,
+        payment_link
+      `)
       .single()
 
     if (companyError || !company) {
-      throw Object.assign(
-        new Error('Não foi possível registrar a empresa.'),
-        { original: companyError }
+      if (isDuplicateError(companyError)) {
+        const duplicate = new Error('Cadastro duplicado.')
+        duplicate.code = '23505'
+        throw duplicate
+      }
+
+      throw companyError || new Error(
+        'Falha ao cadastrar empresa.'
       )
     }
 
     companyId = company.id
 
-    // 3. Cria o perfil e vincula à empresa.
+    // ---------------------------------------------
+    // 3. CRIA PERFIL DO CLIENTE
+    // ---------------------------------------------
+
     const {
       error: profileError
     } = await supabase
@@ -378,61 +607,45 @@ router.post('/register', registerLimiter, async (req, res) => {
       })
 
     if (profileError) {
-      throw Object.assign(
-        new Error('Não foi possível criar o perfil do cliente.'),
-        { original: profileError }
-      )
+      throw profileError
     }
 
-    // Cadastro concluído.
+    registrationCompleted = true
+
+    // ---------------------------------------------
+    // 4. RETORNO DO CADASTRO
+    // ---------------------------------------------
+
     return res.status(201).json({
       success: true,
-      message: 'Cadastro realizado com sucesso. Você já pode entrar na sua conta.',
+      message: 'Cadastro recebido com sucesso. Aguarde a análise da FOODCORE.',
+      next_step: 'pending_review',
+
       customer: {
         id: authUserId,
         full_name: representativeName,
         email
       },
-      company
+
+      company: serializeCompany(company),
+
+      workflow: getCustomerWorkflow(company)
     })
 
   } catch (error) {
     console.error(
       '[FOODCORE] Falha no cadastro:',
-      error.message,
-      error.original?.message || ''
+      error?.message || error
     )
 
-    // Compensação: remove os registros criados caso alguma
-    // etapa posterior falhe.
-    if (companyId) {
-      const { error: rollbackCompanyError } = await supabase
-        .from('companies')
-        .delete()
-        .eq('id', companyId)
-
-      if (rollbackCompanyError) {
-        console.error(
-          '[FOODCORE] Falha ao desfazer cadastro da empresa:',
-          rollbackCompanyError.message
-        )
-      }
+    if (!registrationCompleted) {
+      await rollbackRegistration({
+        authUserId,
+        companyId
+      })
     }
 
-    if (authUserId) {
-      const { error: rollbackUserError } = await supabase.auth.admin.deleteUser(
-        authUserId
-      )
-
-      if (rollbackUserError) {
-        console.error(
-          '[FOODCORE] Falha ao desfazer usuário Auth:',
-          rollbackUserError.message
-        )
-      }
-    }
-
-    if (error.original?.code === '23505') {
+    if (isDuplicateError(error)) {
       return res.status(409).json({
         error: 'Já existe um cadastro com esses dados.'
       })
@@ -444,15 +657,16 @@ router.post('/register', registerLimiter, async (req, res) => {
   }
 })
 
-// ==========================================
+// =====================================================
 // LOGIN DO CLIENTE
-// ==========================================
+// =====================================================
 
 router.post('/login', loginLimiter, async (req, res) => {
   if (!checkSupabase(res)) return
 
   try {
     const email = normalizeEmail(req.body?.email)
+
     const password = typeof req.body?.password === 'string'
       ? req.body.password
       : ''
@@ -464,12 +678,15 @@ router.post('/login', loginLimiter, async (req, res) => {
     }
 
     if (!isValidEmail(email)) {
-      return res.status(400).json({
-        error: 'E-mail ou senha inválidos.'
+      return res.status(401).json({
+        error: 'E-mail ou senha incorretos.'
       })
     }
 
-    // Autentica com a chave publicável.
+    // ---------------------------------------------
+    // AUTENTICAÇÃO
+    // ---------------------------------------------
+
     const {
       data,
       error
@@ -484,7 +701,10 @@ router.post('/login', loginLimiter, async (req, res) => {
       })
     }
 
-    // Busca o perfil do cliente.
+    // ---------------------------------------------
+    // CONSULTA PERFIL
+    // ---------------------------------------------
+
     const {
       data: profile,
       error: profileError
@@ -492,23 +712,40 @@ router.post('/login', loginLimiter, async (req, res) => {
       .from('profiles')
       .select('id, company_id, full_name, email, role')
       .eq('id', data.user.id)
-      .single()
+      .maybeSingle()
 
-    if (profileError || !profile || profile.role !== 'customer' || !profile.company_id) {
+    if (
+      profileError ||
+      !profile ||
+      profile.role !== 'customer' ||
+      !profile.company_id
+    ) {
       return res.status(403).json({
         error: 'Esta conta não possui um perfil de cliente válido.'
       })
     }
 
-    // Busca a situação da empresa.
+    // ---------------------------------------------
+    // CONSULTA EMPRESA E ESTADO DO FLUXO
+    // ---------------------------------------------
+
     const {
       data: company,
       error: companyError
     } = await supabase
       .from('companies')
-      .select('id, legal_name, trade_name, status')
+      .select(`
+        id,
+        legal_name,
+        trade_name,
+        cnpj,
+        status,
+        registration_status,
+        payment_link,
+        created_at
+      `)
       .eq('id', profile.company_id)
-      .single()
+      .maybeSingle()
 
     if (companyError || !company) {
       return res.status(403).json({
@@ -516,28 +753,37 @@ router.post('/login', loginLimiter, async (req, res) => {
       })
     }
 
+    // ---------------------------------------------
+    // RETORNO DA SESSÃO
+    // ---------------------------------------------
+
     return res.json({
       success: true,
       message: 'Login realizado com sucesso.',
+
       session: {
         access_token: data.session.access_token,
         refresh_token: data.session.refresh_token,
         expires_in: data.session.expires_in,
         token_type: data.session.token_type
       },
+
       customer: {
         id: profile.id,
         full_name: profile.full_name,
         email: profile.email,
         role: profile.role
       },
-      company
+
+      company: serializeCompany(company),
+
+      workflow: getCustomerWorkflow(company)
     })
 
   } catch (error) {
     console.error(
       '[FOODCORE] Erro no login do cliente:',
-      error.message
+      error?.message || error
     )
 
     return res.status(500).json({
@@ -546,15 +792,86 @@ router.post('/login', loginLimiter, async (req, res) => {
   }
 })
 
-// ==========================================
-// DADOS DA CONTA AUTENTICADA
-// ==========================================
+// =====================================================
+// DADOS ATUALIZADOS DA CONTA AUTENTICADA
+// =====================================================
 
 router.get('/me', requireCustomer, async (req, res) => {
-  return res.json({
-    success: true,
-    customer: req.customer
-  })
+  if (!supabase) {
+    return res.status(503).json({
+      error: 'Serviço temporariamente indisponível.'
+    })
+  }
+
+  try {
+    const companyId = (
+      req.customer?.companyId ||
+      req.customer?.company_id
+    )
+
+    if (!companyId) {
+      return res.status(403).json({
+        error: 'Empresa vinculada à conta não encontrada.'
+      })
+    }
+
+    // Consulta novamente o banco para não depender
+    // de informações antigas presentes no token.
+    const {
+      data: company,
+      error: companyError
+    } = await supabase
+      .from('companies')
+      .select(`
+        id,
+        legal_name,
+        trade_name,
+        cnpj,
+        status,
+        registration_status,
+        payment_link,
+        created_at
+      `)
+      .eq('id', companyId)
+      .maybeSingle()
+
+    if (companyError || !company) {
+      console.error(
+        '[FOODCORE] Erro ao consultar empresa:',
+        companyError?.message
+      )
+
+      return res.status(404).json({
+        error: 'Empresa vinculada à conta não encontrada.'
+      })
+    }
+
+    const workflow = getCustomerWorkflow(company)
+
+    return res.json({
+      success: true,
+
+      customer: req.customer,
+
+      company: serializeCompany(company),
+
+      workflow
+    })
+
+  } catch (error) {
+    console.error(
+      '[FOODCORE] Erro ao consultar conta:',
+      error?.message || error
+    )
+
+    return res.status(500).json({
+      error: 'Não foi possível consultar os dados da conta.'
+    })
+  }
 })
+
+// =====================================================
+// EXPORTAÇÃO
+// =====================================================
 
 export default router

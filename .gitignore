@@ -18,3 +18,7 @@ server/storage/releases/*
 # Arquivos de log
 *.log
 npm-debug.log*
+
+# Contratos e documentos privados
+/contrato-foodcore-teste.pdf
+/server/contrato-foodcore-assinado.pdf

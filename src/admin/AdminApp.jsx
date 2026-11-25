@@ -1,3 +1,4 @@
+
 import React, { useEffect, useState } from 'react'
 import {
   Activity,
@@ -6,7 +7,6 @@ import {
   CloudUpload,
   FileArchive,
   FileCheck,
-  KeyRound,
   LogOut,
   RefreshCw,
   ShieldCheck,
@@ -17,12 +17,19 @@ import {
   Eye,
   AlertCircle,
   Receipt,
-  CreditCard
+  CreditCard,
+  Users,
+  Link2,
+  Copy,
+  ExternalLink,
+  UserRound,
+  MapPin,
+  CalendarDays
 } from 'lucide-react'
 
 import './admin.css'
 
-const API = import.meta.env.VITE_API_URL || 'https://foodcore-api.onrender.com/api'
+const API = 'https://foodcore-api.onrender.com/api'
 
 function formatCurrency(value) {
   return Number(value || 0).toLocaleString('pt-BR', {
@@ -34,8 +41,59 @@ function formatCurrency(value) {
 function formatDate(value) {
   if (!value) return '-'
 
-  return new Date(`${value}`.length === 10 ? `${value}T12:00:00` : value)
-    .toLocaleString('pt-BR')
+  const date = new Date(
+    String(value).length === 10 ? `${value}T12:00:00` : value
+  )
+
+  if (Number.isNaN(date.getTime())) return '-'
+
+  return date.toLocaleString('pt-BR')
+}
+
+function formatCpf(value) {
+  const digits = String(value || '').replace(/\D/g, '')
+
+  if (digits.length !== 11) return value || '-'
+
+  return digits.replace(
+    /^(\d{3})(\d{3})(\d{3})(\d{2})$/,
+    '$1.$2.$3-$4'
+  )
+}
+
+function formatCnpj(value) {
+  const raw = String(value || '').toUpperCase()
+  const digits = raw.replace(/\D/g, '')
+
+  if (digits.length === 14) {
+    return digits.replace(
+      /^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/,
+      '$1.$2.$3/$4-$5'
+    )
+  }
+
+  return raw || '-'
+}
+
+function getCompanyName(company) {
+  return (
+    company?.trade_name ||
+    company?.legal_name ||
+    'Empresa não identificada'
+  )
+}
+
+function getErrorMessage(error, fallback) {
+  return error?.message || fallback
+}
+
+function DetailItem({ label, value }) {
+  return (
+    <div>
+      <small>{label}</small>
+      <b>{value || '-'}</b>
+    </div>
+  )
 }
 
 export default function AdminApp() {
@@ -53,6 +111,7 @@ export default function AdminApp() {
   const [releases, setReleases] = useState([])
   const [contracts, setContracts] = useState([])
   const [payments, setPayments] = useState([])
+  const [customers, setCustomers] = useState([])
 
   const [message, setMessage] = useState('')
   const [messageType, setMessageType] = useState('success')
@@ -60,9 +119,15 @@ export default function AdminApp() {
   const [busy, setBusy] = useState(false)
   const [loadingContracts, setLoadingContracts] = useState(false)
   const [loadingPayments, setLoadingPayments] = useState(false)
+  const [loadingCustomers, setLoadingCustomers] = useState(false)
 
   const [selectedContract, setSelectedContract] = useState(null)
   const [selectedPayment, setSelectedPayment] = useState(null)
+  const [selectedCustomer, setSelectedCustomer] = useState(null)
+
+  const [customerSubscriptions, setCustomerSubscriptions] = useState([])
+  const [customerPaymentLink, setCustomerPaymentLink] = useState('')
+  const [loadingCustomerDetails, setLoadingCustomerDetails] = useState(false)
 
   const [rejectionReason, setRejectionReason] = useState('')
   const [paymentRejectionReason, setPaymentRejectionReason] = useState('')
@@ -79,8 +144,14 @@ export default function AdminApp() {
     setReleases([])
     setContracts([])
     setPayments([])
+    setCustomers([])
+
     setSelectedContract(null)
     setSelectedPayment(null)
+    setSelectedCustomer(null)
+
+    setCustomerSubscriptions([])
+    setCustomerPaymentLink('')
   }
 
   async function request(path, options = {}) {
@@ -88,9 +159,7 @@ export default function AdminApp() {
       ...options,
       headers: {
         ...(options.headers || {}),
-        ...(token
-          ? { Authorization: `Bearer ${token}` }
-          : {})
+        ...(token ? { Authorization: `Bearer ${token}` } : {})
       }
     })
 
@@ -137,15 +206,21 @@ export default function AdminApp() {
     link.click()
     link.remove()
 
-    window.URL.revokeObjectURL(url)
+    window.setTimeout(() => {
+      window.URL.revokeObjectURL(url)
+    }, 1000)
   }
+
+  // =====================================================
+  // CARREGAMENTO DOS DADOS
+  // =====================================================
 
   async function loadReleases() {
     try {
       const data = await request('/admin/releases')
       setReleases(data.releases || [])
     } catch (error) {
-      showMessage(error.message, 'error')
+      showMessage(getErrorMessage(error, 'Erro ao carregar versões.'), 'error')
     }
   }
 
@@ -156,7 +231,7 @@ export default function AdminApp() {
       const data = await request('/admin/contracts')
       setContracts(data.contracts || [])
     } catch (error) {
-      showMessage(error.message, 'error')
+      showMessage(getErrorMessage(error, 'Erro ao carregar contratos.'), 'error')
     } finally {
       setLoadingContracts(false)
     }
@@ -169,9 +244,22 @@ export default function AdminApp() {
       const data = await request('/admin/payments')
       setPayments(data.payments || [])
     } catch (error) {
-      showMessage(error.message, 'error')
+      showMessage(getErrorMessage(error, 'Erro ao carregar pagamentos.'), 'error')
     } finally {
       setLoadingPayments(false)
+    }
+  }
+
+  async function loadCustomers() {
+    setLoadingCustomers(true)
+
+    try {
+      const data = await request('/admin/customers/pending')
+      setCustomers(data.customers || [])
+    } catch (error) {
+      showMessage(getErrorMessage(error, 'Erro ao carregar cadastros.'), 'error')
+    } finally {
+      setLoadingCustomers(false)
     }
   }
 
@@ -179,7 +267,8 @@ export default function AdminApp() {
     await Promise.all([
       loadReleases(),
       loadContracts(),
-      loadPayments()
+      loadPayments(),
+      loadCustomers()
     ])
   }
 
@@ -188,6 +277,10 @@ export default function AdminApp() {
       loadDashboard()
     }
   }, [token])
+
+  // =====================================================
+  // AUTENTICAÇÃO
+  // =====================================================
 
   async function login(event) {
     event.preventDefault()
@@ -217,14 +310,144 @@ export default function AdminApp() {
     }
   }
 
+  // =====================================================
+  // CADASTROS DE CLIENTES
+  // =====================================================
+
+  async function openCustomer(customer) {
+    setSelectedCustomer(customer)
+    setCustomerPaymentLink(customer.payment_link || '')
+    setCustomerSubscriptions([])
+    setLoadingCustomerDetails(true)
+    setMessage('')
+
+    try {
+      const data = await request(`/admin/customers/${customer.id}`)
+
+      setSelectedCustomer(data.company || customer)
+      setCustomerPaymentLink(data.company?.payment_link || '')
+      setCustomerSubscriptions(data.subscriptions || [])
+    } catch (error) {
+      showMessage(
+        getErrorMessage(error, 'Não foi possível carregar os dados da empresa.'),
+        'error'
+      )
+    } finally {
+      setLoadingCustomerDetails(false)
+    }
+  }
+
+  function closeCustomer() {
+    if (busy) return
+
+    setSelectedCustomer(null)
+    setCustomerSubscriptions([])
+    setCustomerPaymentLink('')
+  }
+
+  async function saveCustomerPaymentLink(event) {
+    event.preventDefault()
+
+    if (!selectedCustomer) return
+
+    const paymentLink = customerPaymentLink.trim()
+
+    if (!paymentLink) {
+      return showMessage('Informe o link de pagamento.', 'error')
+    }
+
+    try {
+      const parsedUrl = new URL(paymentLink)
+
+      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        throw new Error('Protocolo inválido.')
+      }
+    } catch {
+      return showMessage(
+        'Informe um endereço válido iniciado por http:// ou https://.',
+        'error'
+      )
+    }
+
+    if (paymentLink.length > 2048) {
+      return showMessage(
+        'O link ultrapassa o limite de 2.048 caracteres.',
+        'error'
+      )
+    }
+
+    setBusy(true)
+    setMessage('')
+
+    try {
+      const data = await request(
+        `/admin/customers/${selectedCustomer.id}/payment-link`,
+        {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            payment_link: paymentLink
+          })
+        }
+      )
+
+      showMessage(
+        data.message || 'Link de pagamento vinculado com sucesso.'
+      )
+
+      setSelectedCustomer(current => ({
+        ...current,
+        ...(data.company || {}),
+        payment_link: paymentLink
+      }))
+
+      await loadCustomers()
+
+      // Atualiza os detalhes com o estado mais recente do servidor.
+      const refreshed = await request(
+        `/admin/customers/${selectedCustomer.id}`
+      )
+
+      setSelectedCustomer(refreshed.company || selectedCustomer)
+      setCustomerPaymentLink(
+        refreshed.company?.payment_link || paymentLink
+      )
+      setCustomerSubscriptions(refreshed.subscriptions || [])
+    } catch (error) {
+      showMessage(
+        getErrorMessage(error, 'Não foi possível vincular o link de pagamento.'),
+        'error'
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function copyPaymentLink() {
+    if (!customerPaymentLink) return
+
+    try {
+      await navigator.clipboard.writeText(customerPaymentLink)
+      showMessage('Link copiado para a área de transferência.')
+    } catch {
+      showMessage(
+        'Não foi possível copiar automaticamente. Selecione e copie o link.',
+        'error'
+      )
+    }
+  }
+
+  // =====================================================
+  // PUBLICAÇÃO DE VERSÕES
+  // =====================================================
+
   async function upload(event) {
     event.preventDefault()
 
     if (!file) {
-      return showMessage(
-        'Selecione o instalador .exe primeiro.',
-        'error'
-      )
+      return showMessage('Selecione o instalador .exe primeiro.', 'error')
     }
 
     const form = new FormData()
@@ -242,9 +465,7 @@ export default function AdminApp() {
         body: form
       })
 
-      showMessage(
-        `Versão ${data.release.version} publicada com sucesso.`
-      )
+      showMessage(`Versão ${data.release.version} publicada com sucesso.`)
 
       setFile(null)
       event.target.reset()
@@ -256,6 +477,10 @@ export default function AdminApp() {
       setBusy(false)
     }
   }
+
+  // =====================================================
+  // CONTRATOS
+  // =====================================================
 
   async function downloadContract(contract) {
     setBusy(true)
@@ -288,10 +513,7 @@ export default function AdminApp() {
       return
     }
 
-    if (
-      decision === 'reject' &&
-      rejectionReason.trim().length < 5
-    ) {
+    if (decision === 'reject' && rejectionReason.trim().length < 5) {
       return showMessage(
         'Informe uma justificativa com pelo menos 5 caracteres.',
         'error'
@@ -311,9 +533,7 @@ export default function AdminApp() {
           },
           body: JSON.stringify({
             decision,
-            reason: decision === 'reject'
-              ? rejectionReason.trim()
-              : ''
+            reason: decision === 'reject' ? rejectionReason.trim() : ''
           })
         }
       )
@@ -333,6 +553,10 @@ export default function AdminApp() {
       setBusy(false)
     }
   }
+
+  // =====================================================
+  // PAGAMENTOS
+  // =====================================================
 
   async function downloadPaymentReceipt(payment) {
     setBusy(true)
@@ -400,7 +624,10 @@ export default function AdminApp() {
       setSelectedPayment(null)
       setPaymentRejectionReason('')
 
-      await loadPayments()
+      await Promise.all([
+        loadPayments(),
+        loadCustomers()
+      ])
     } catch (error) {
       showMessage(error.message, 'error')
     } finally {
@@ -408,11 +635,14 @@ export default function AdminApp() {
     }
   }
 
+  // =====================================================
+  // LOGIN
+  // =====================================================
+
   if (!token) {
     return (
       <main className="admin-shell">
         <div className="admin-login">
-
           <a className="admin-back" href="/">
             <ArrowLeft size={16} />
             Voltar ao site
@@ -434,7 +664,7 @@ export default function AdminApp() {
             <h1>Painel administrativo</h1>
 
             <p>
-              Acesse para gerenciar contratos,
+              Acesse para gerenciar cadastros, contratos,
               pagamentos, licenças e distribuição do ERP.
             </p>
 
@@ -445,6 +675,7 @@ export default function AdminApp() {
                 type="email"
                 value={email}
                 onChange={event => setEmail(event.target.value)}
+                autoComplete="username"
                 required
                 placeholder="admin@foodcore.com.br"
               />
@@ -455,6 +686,7 @@ export default function AdminApp() {
                 type="password"
                 value={password}
                 onChange={event => setPassword(event.target.value)}
+                autoComplete="current-password"
                 required
                 placeholder="Sua senha"
               />
@@ -479,9 +711,12 @@ export default function AdminApp() {
     )
   }
 
+  // =====================================================
+  // PAINEL
+  // =====================================================
+
   return (
     <main className="admin-shell">
-
       <header className="admin-top">
         <a className="admin-brand" href="/">
           <span>F</span>
@@ -505,7 +740,6 @@ export default function AdminApp() {
       </header>
 
       <div className="admin-content">
-
         <div className="admin-heading">
           <div>
             <div className="admin-kicker">
@@ -515,8 +749,8 @@ export default function AdminApp() {
             <h1>Painel administrativo</h1>
 
             <p>
-              Gerencie contratos, pagamentos, clientes
-              e atualizações do FOODCORE ERP.
+              Gerencie cadastros, contratos, pagamentos e atualizações
+              do FOODCORE ERP.
             </p>
           </div>
 
@@ -532,12 +766,18 @@ export default function AdminApp() {
               ? <AlertCircle size={17} />
               : <CheckCircle2 size={17} />
             }
-
             {message}
           </div>
         )}
 
+        {/* INDICADORES */}
+
         <section className="admin-stats">
+          <article>
+            <span><Users /></span>
+            <small>CADASTROS PENDENTES</small>
+            <b>{customers.length}</b>
+          </article>
 
           <article>
             <span><FileCheck /></span>
@@ -556,13 +796,90 @@ export default function AdminApp() {
             <small>VERSÕES PUBLICADAS</small>
             <b>{releases.length}</b>
           </article>
+        </section>
 
+        {/* CADASTROS DE CLIENTES */}
+
+        <section className="admin-panel customer-section">
+          <div className="admin-panel-title">
+            <div>
+              <h2>Cadastros de clientes</h2>
+              <p>
+                Analise os dados das empresas e vincule o link externo
+                para pagamento da primeira mensalidade.
+              </p>
+            </div>
+
+            <button
+              className="refresh-button"
+              onClick={loadCustomers}
+              disabled={loadingCustomers}
+            >
+              <RefreshCw
+                size={15}
+                className={loadingCustomers ? 'admin-spin' : ''}
+              />
+              Atualizar
+            </button>
+          </div>
+
+          {loadingCustomers ? (
+            <div className="empty-state">
+              Carregando cadastros...
+            </div>
+          ) : customers.length === 0 ? (
+            <div className="empty-state">
+              <Users size={30} />
+              <p>Nenhum cadastro aguardando análise.</p>
+            </div>
+          ) : (
+            <div className="contract-list">
+              {customers.map(customer => (
+                <article className="contract-card" key={customer.id}>
+                  <div className="contract-card-main">
+                    <div className="contract-company-icon">
+                      <Building2 size={21} />
+                    </div>
+
+                    <div className="contract-company-info">
+                      <h3>{getCompanyName(customer)}</h3>
+
+                      <span>{customer.legal_name || '-'}</span>
+
+                      <small>
+                        CNPJ: {formatCnpj(customer.cnpj)}
+                      </small>
+                    </div>
+                  </div>
+
+                  <div className="contract-card-meta">
+                    <span>{customer.email || 'E-mail não informado'}</span>
+
+                    <span>
+                      Cadastro: {formatDate(customer.created_at)}
+                    </span>
+
+                    <b className="contract-pending">
+                      Aguardando análise
+                    </b>
+                  </div>
+
+                  <button
+                    className="contract-view-button"
+                    onClick={() => openCustomer(customer)}
+                  >
+                    <Eye size={15} />
+                    Analisar cadastro
+                  </button>
+                </article>
+              ))}
+            </div>
+          )}
         </section>
 
         {/* CONTRATOS */}
 
         <section className="admin-panel contract-section">
-
           <div className="admin-panel-title">
             <div>
               <h2>Gestão de contratos</h2>
@@ -595,10 +912,8 @@ export default function AdminApp() {
             </div>
           ) : (
             <div className="contract-list">
-
               {contracts.map(contract => (
                 <article className="contract-card" key={contract.id}>
-
                   <div className="contract-card-main">
                     <div className="contract-company-icon">
                       <Building2 size={21} />
@@ -611,9 +926,7 @@ export default function AdminApp() {
                           'Empresa não identificada'}
                       </h3>
 
-                      <span>
-                        {contract.company?.legal_name}
-                      </span>
+                      <span>{contract.company?.legal_name}</span>
 
                       <small>
                         Contrato {contract.contract_number}
@@ -645,19 +958,15 @@ export default function AdminApp() {
                     <Eye size={15} />
                     Analisar contrato
                   </button>
-
                 </article>
               ))}
-
             </div>
           )}
-
         </section>
 
         {/* PAGAMENTOS */}
 
         <section className="admin-panel payment-section">
-
           <div className="admin-panel-title">
             <div>
               <h2>Gestão de pagamentos</h2>
@@ -690,10 +999,8 @@ export default function AdminApp() {
             </div>
           ) : (
             <div className="contract-list">
-
               {payments.map(payment => (
                 <article className="contract-card" key={payment.id}>
-
                   <div className="contract-card-main">
                     <div className="contract-company-icon">
                       <Receipt size={21} />
@@ -701,13 +1008,13 @@ export default function AdminApp() {
 
                     <div className="contract-company-info">
                       <h3>
-                        {payment.company?.trade_name ||
-                          payment.company?.legal_name ||
+                        {payment.subscription?.company?.trade_name ||
+                          payment.subscription?.company?.legal_name ||
                           'Empresa não identificada'}
                       </h3>
 
                       <span>
-                        {payment.company?.legal_name || '-'}
+                        {payment.subscription?.company?.legal_name || '-'}
                       </span>
 
                       <small>
@@ -740,21 +1047,16 @@ export default function AdminApp() {
                     <Eye size={15} />
                     Analisar pagamento
                   </button>
-
                 </article>
               ))}
-
             </div>
           )}
-
         </section>
 
         {/* DISTRIBUIÇÃO DO ERP */}
 
         <div className="admin-columns">
-
           <section className="admin-panel">
-
             <div className="admin-panel-title">
               <div>
                 <h2>Enviar novo instalador</h2>
@@ -768,7 +1070,6 @@ export default function AdminApp() {
             </div>
 
             <form className="release-form" onSubmit={upload}>
-
               <label>Arquivo executável (.exe)</label>
 
               <input
@@ -781,7 +1082,7 @@ export default function AdminApp() {
               />
 
               <small>
-                Limite padrão de 500 MB.
+                Limite configurado no servidor.
                 Envie apenas instaladores assinados e validados.
               </small>
 
@@ -806,13 +1107,10 @@ export default function AdminApp() {
               <button disabled={busy}>
                 {busy ? 'Enviando...' : 'Publicar versão'}
               </button>
-
             </form>
-
           </section>
 
           <section className="admin-panel">
-
             <div className="admin-panel-title">
               <div>
                 <h2>Fluxo de distribuição</h2>
@@ -853,15 +1151,12 @@ export default function AdminApp() {
                 </span>
               </li>
             </ol>
-
           </section>
-
         </div>
 
         {/* HISTÓRICO DE VERSÕES */}
 
         <section className="admin-panel release-history">
-
           <div className="admin-panel-title">
             <div>
               <h2>Versões publicadas</h2>
@@ -885,7 +1180,6 @@ export default function AdminApp() {
             </div>
           ) : (
             <div className="release-table">
-
               <div className="release-row release-head">
                 <span>VERSÃO</span>
                 <span>ARQUIVO</span>
@@ -910,10 +1204,8 @@ export default function AdminApp() {
                   </a>
                 </div>
               ))}
-
             </div>
           )}
-
         </section>
 
         <footer className="admin-footer">
@@ -921,8 +1213,321 @@ export default function AdminApp() {
           <span>•</span>
           Painel restrito
         </footer>
-
       </div>
+
+      {/* MODAL DE CADASTRO */}
+
+      {selectedCustomer && (
+        <div
+          className="contract-modal-overlay"
+          onClick={event => {
+            if (
+              event.target === event.currentTarget &&
+              !busy
+            ) {
+              closeCustomer()
+            }
+          }}
+        >
+          <section className="contract-modal">
+            <div className="contract-modal-header">
+              <div>
+                <div className="admin-kicker">
+                  ANÁLISE CADASTRAL
+                </div>
+
+                <h2>{getCompanyName(selectedCustomer)}</h2>
+              </div>
+
+              <button
+                className="modal-close"
+                onClick={closeCustomer}
+                disabled={busy}
+              >
+                <X size={19} />
+              </button>
+            </div>
+
+            <div className="contract-modal-body">
+              {loadingCustomerDetails ? (
+                <div className="empty-state">
+                  Carregando dados da empresa...
+                </div>
+              ) : (
+                <>
+                  <div className="contract-detail-block">
+                    <h3>
+                      <Building2 size={17} />
+                      Dados da empresa
+                    </h3>
+
+                    <div className="contract-detail-grid">
+                      <DetailItem
+                        label="Razão social"
+                        value={selectedCustomer.legal_name}
+                      />
+
+                      <DetailItem
+                        label="Nome fantasia"
+                        value={selectedCustomer.trade_name}
+                      />
+
+                      <DetailItem
+                        label="CNPJ"
+                        value={formatCnpj(selectedCustomer.cnpj)}
+                      />
+
+                      <DetailItem
+                        label="Inscrição estadual"
+                        value={selectedCustomer.state_registration}
+                      />
+
+                      <DetailItem
+                        label="E-mail empresarial"
+                        value={selectedCustomer.email}
+                      />
+
+                      <DetailItem
+                        label="Telefone"
+                        value={selectedCustomer.phone}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="contract-detail-block">
+                    <h3>
+                      <UserRound size={17} />
+                      Responsável legal
+                    </h3>
+
+                    <div className="contract-detail-grid">
+                      <DetailItem
+                        label="Nome do representante"
+                        value={selectedCustomer.representative_name}
+                      />
+
+                      <DetailItem
+                        label="CPF do representante"
+                        value={formatCpf(selectedCustomer.representative_cpf)}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="contract-detail-block">
+                    <h3>
+                      <MapPin size={17} />
+                      Endereço
+                    </h3>
+
+                    <div className="contract-detail-grid">
+                      <DetailItem
+                        label="CEP"
+                        value={selectedCustomer.postal_code}
+                      />
+
+                      <DetailItem
+                        label="Logradouro"
+                        value={selectedCustomer.street}
+                      />
+
+                      <DetailItem
+                        label="Número"
+                        value={selectedCustomer.number}
+                      />
+
+                      <DetailItem
+                        label="Complemento"
+                        value={selectedCustomer.complement}
+                      />
+
+                      <DetailItem
+                        label="Bairro"
+                        value={selectedCustomer.neighborhood}
+                      />
+
+                      <DetailItem
+                        label="Cidade"
+                        value={selectedCustomer.city}
+                      />
+
+                      <DetailItem
+                        label="Estado"
+                        value={selectedCustomer.state}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="contract-detail-block">
+                    <h3>
+                      <CalendarDays size={17} />
+                      Situação do cadastro
+                    </h3>
+
+                    <div className="contract-detail-grid">
+                      <DetailItem
+                        label="Data de cadastro"
+                        value={formatDate(selectedCustomer.created_at)}
+                      />
+
+                      <DetailItem
+                        label="Status cadastral"
+                        value={
+                          selectedCustomer.registration_status === 'awaiting_payment'
+                            ? 'Aguardando pagamento'
+                            : selectedCustomer.registration_status === 'payment_under_review'
+                              ? 'Pagamento em análise'
+                              : selectedCustomer.registration_status === 'active'
+                                ? 'Ativo'
+                                : 'Aguardando análise'
+                        }
+                      />
+
+                      <DetailItem
+                        label="Status operacional"
+                        value={selectedCustomer.status || '-'}
+                      />
+                    </div>
+                  </div>
+
+                  {customerSubscriptions.length > 0 && (
+                    <div className="contract-detail-block">
+                      <h3>
+                        <CreditCard size={17} />
+                        Assinaturas vinculadas
+                      </h3>
+
+                      <div className="contract-detail-grid">
+                        {customerSubscriptions.map(subscription => (
+                          <React.Fragment key={subscription.id}>
+                            <DetailItem
+                              label="Valor mensal"
+                              value={formatCurrency(subscription.monthly_price)}
+                            />
+
+                            <DetailItem
+                              label="Próximo vencimento"
+                              value={formatDate(subscription.next_due_date)}
+                            />
+
+                            <DetailItem
+                              label="Situação da assinatura"
+                              value={subscription.status}
+                            />
+                          </React.Fragment>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="contract-validation-notice">
+                    <ShieldCheck size={19} />
+
+                    <div>
+                      <b>Conferência dos dados</b>
+                      <p>
+                        Confira os dados cadastrais e a identificação
+                        da empresa antes de vincular o pagamento.
+                        O CPF do representante é exibido somente
+                        nesta área administrativa.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="contract-detail-block">
+                    <h3>
+                      <Link2 size={17} />
+                      Link externo de pagamento
+                    </h3>
+
+                    <p>
+                      Informe o link de cobrança que será disponibilizado
+                      ao cliente no portal FOODCORE.
+                    </p>
+
+                    <form
+                      className="release-form"
+                      onSubmit={saveCustomerPaymentLink}
+                    >
+                      <label htmlFor="customer-payment-link">
+                        Link de pagamento
+                      </label>
+
+                      <input
+                        id="customer-payment-link"
+                        type="url"
+                        value={customerPaymentLink}
+                        onChange={event =>
+                          setCustomerPaymentLink(event.target.value)
+                        }
+                        maxLength={2048}
+                        placeholder="https://..."
+                        required
+                      />
+
+                      <small>
+                        Aceita endereços HTTP e HTTPS. O pagamento
+                        é realizado externamente à plataforma.
+                      </small>
+
+                      <button
+                        type="submit"
+                        disabled={busy || loadingCustomerDetails}
+                      >
+                        {busy
+                          ? 'Vinculando...'
+                          : 'Vincular link e gerar cobrança'}
+                      </button>
+                    </form>
+
+                    {selectedCustomer.payment_link && (
+                      <div className="contract-validation-notice">
+                        <CheckCircle2 size={19} />
+
+                        <div>
+                          <b>Link já vinculado</b>
+
+                          <p>
+                            O cadastro está aguardando o pagamento
+                            da primeira mensalidade.
+                          </p>
+
+                          <a
+                            href={selectedCustomer.payment_link}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            Abrir link de pagamento
+                          </a>
+
+                          <button
+                            type="button"
+                            className="refresh-button"
+                            onClick={copyPaymentLink}
+                          >
+                            <Copy size={15} />
+                            Copiar link
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="contract-modal-actions">
+              <button
+                className="contract-reject-button"
+                onClick={closeCustomer}
+                disabled={busy}
+              >
+                <X size={16} />
+                Fechar
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {/* MODAL DE CONTRATO */}
 
@@ -935,9 +1540,7 @@ export default function AdminApp() {
             }
           }}
         >
-
           <section className="contract-modal">
-
             <div className="contract-modal-header">
               <div>
                 <div className="admin-kicker">
@@ -957,7 +1560,6 @@ export default function AdminApp() {
             </div>
 
             <div className="contract-modal-body">
-
               <div className="contract-detail-block">
                 <h3>
                   <Building2 size={17} />
@@ -965,49 +1567,48 @@ export default function AdminApp() {
                 </h3>
 
                 <div className="contract-detail-grid">
-                  <div>
-                    <small>Razão social</small>
-                    <b>{selectedContract.company?.legal_name || '-'}</b>
-                  </div>
+                  <DetailItem
+                    label="Razão social"
+                    value={selectedContract.company?.legal_name}
+                  />
 
-                  <div>
-                    <small>Nome fantasia</small>
-                    <b>{selectedContract.company?.trade_name || '-'}</b>
-                  </div>
+                  <DetailItem
+                    label="Nome fantasia"
+                    value={selectedContract.company?.trade_name}
+                  />
 
-                  <div>
-                    <small>CNPJ</small>
-                    <b>{selectedContract.company?.cnpj || '-'}</b>
-                  </div>
+                  <DetailItem
+                    label="CNPJ"
+                    value={selectedContract.company?.cnpj}
+                  />
 
-                  <div>
-                    <small>E-mail</small>
-                    <b>{selectedContract.company?.email || '-'}</b>
-                  </div>
+                  <DetailItem
+                    label="E-mail"
+                    value={selectedContract.company?.email}
+                  />
 
-                  <div>
-                    <small>Telefone</small>
-                    <b>{selectedContract.company?.phone || '-'}</b>
-                  </div>
+                  <DetailItem
+                    label="Telefone"
+                    value={selectedContract.company?.phone}
+                  />
 
-                  <div>
-                    <small>Representante</small>
-                    <b>{selectedContract.company?.representative_name || '-'}</b>
-                  </div>
+                  <DetailItem
+                    label="Representante"
+                    value={selectedContract.company?.representative_name}
+                  />
 
-                  <div>
-                    <small>CPF do representante</small>
-                    <b>{selectedContract.company?.representative_cpf || '-'}</b>
-                  </div>
+                  <DetailItem
+                    label="CPF do representante"
+                    value={formatCpf(selectedContract.company?.representative_cpf)}
+                  />
 
-                  <div>
-                    <small>Localização</small>
-                    <b>
-                      {[selectedContract.company?.city, selectedContract.company?.state]
-                        .filter(Boolean)
-                        .join(' / ') || '-'}
-                    </b>
-                  </div>
+                  <DetailItem
+                    label="Localização"
+                    value={[
+                      selectedContract.company?.city,
+                      selectedContract.company?.state
+                    ].filter(Boolean).join(' / ')}
+                  />
                 </div>
               </div>
 
@@ -1018,22 +1619,20 @@ export default function AdminApp() {
                 </h3>
 
                 <div className="contract-detail-grid">
-                  <div>
-                    <small>Valor mensal</small>
-                    <b>{formatCurrency(selectedContract.monthly_price)}</b>
-                  </div>
+                  <DetailItem
+                    label="Valor mensal"
+                    value={formatCurrency(selectedContract.monthly_price)}
+                  />
 
-                  <div>
-                    <small>Recebido em</small>
-                    <b>{formatDate(selectedContract.signed_at)}</b>
-                  </div>
+                  <DetailItem
+                    label="Recebido em"
+                    value={formatDate(selectedContract.signed_at)}
+                  />
 
-                  <div>
-                    <small>Status</small>
-                    <b className="contract-pending">
-                      Aguardando análise
-                    </b>
-                  </div>
+                  <DetailItem
+                    label="Status"
+                    value="Aguardando análise"
+                  />
                 </div>
               </div>
 
@@ -1073,11 +1672,9 @@ export default function AdminApp() {
                   placeholder="Descreva o motivo da rejeição..."
                 />
               </div>
-
             </div>
 
             <div className="contract-modal-actions">
-
               <button
                 className="contract-reject-button"
                 onClick={() => decideContract('reject')}
@@ -1095,11 +1692,8 @@ export default function AdminApp() {
                 <Check size={16} />
                 {busy ? 'Processando...' : 'Aprovar contrato'}
               </button>
-
             </div>
-
           </section>
-
         </div>
       )}
 
@@ -1114,9 +1708,7 @@ export default function AdminApp() {
             }
           }}
         >
-
           <section className="contract-modal">
-
             <div className="contract-modal-header">
               <div>
                 <div className="admin-kicker">
@@ -1136,7 +1728,6 @@ export default function AdminApp() {
             </div>
 
             <div className="contract-modal-body">
-
               <div className="contract-detail-block">
                 <h3>
                   <Building2 size={17} />
@@ -1144,29 +1735,25 @@ export default function AdminApp() {
                 </h3>
 
                 <div className="contract-detail-grid">
-                  <div>
-                    <small>Empresa</small>
-                    <b>
-                      {selectedPayment.company?.trade_name ||
-                        selectedPayment.company?.legal_name ||
-                        '-'}
-                    </b>
-                  </div>
+                  <DetailItem
+                    label="Empresa"
+                    value={getCompanyName(selectedPayment.subscription?.company)}
+                  />
 
-                  <div>
-                    <small>Razão social</small>
-                    <b>{selectedPayment.company?.legal_name || '-'}</b>
-                  </div>
+                  <DetailItem
+                    label="Razão social"
+                    value={selectedPayment.subscription?.company?.legal_name}
+                  />
 
-                  <div>
-                    <small>CNPJ</small>
-                    <b>{selectedPayment.company?.cnpj || '-'}</b>
-                  </div>
+                  <DetailItem
+                    label="CNPJ"
+                    value={selectedPayment.subscription?.company?.cnpj}
+                  />
 
-                  <div>
-                    <small>E-mail</small>
-                    <b>{selectedPayment.company?.email || '-'}</b>
-                  </div>
+                  <DetailItem
+                    label="E-mail"
+                    value={selectedPayment.subscription?.company?.email}
+                  />
                 </div>
               </div>
 
@@ -1177,38 +1764,38 @@ export default function AdminApp() {
                 </h3>
 
                 <div className="contract-detail-grid">
-                  <div>
-                    <small>Valor</small>
-                    <b>{formatCurrency(selectedPayment.amount)}</b>
-                  </div>
+                  <DetailItem
+                    label="Valor"
+                    value={formatCurrency(selectedPayment.amount)}
+                  />
 
-                  <div>
-                    <small>Vencimento</small>
-                    <b>{formatDate(selectedPayment.due_date)}</b>
-                  </div>
+                  <DetailItem
+                    label="Vencimento"
+                    value={formatDate(selectedPayment.due_date)}
+                  />
 
-                  <div>
-                    <small>Forma de pagamento</small>
-                    <b>
-                      {selectedPayment.payment_method === 'pix'
+                  <DetailItem
+                    label="Forma de pagamento"
+                    value={
+                      selectedPayment.payment_method === 'pix'
                         ? 'PIX'
-                        : 'Transferência bancária'}
-                    </b>
-                  </div>
+                        : 'Transferência bancária'
+                    }
+                  />
 
-                  <div>
-                    <small>Data de envio</small>
-                    <b>{formatDate(selectedPayment.created_at)}</b>
-                  </div>
+                  <DetailItem
+                    label="Data de envio"
+                    value={formatDate(selectedPayment.created_at)}
+                  />
 
-                  <div>
-                    <small>Status</small>
-                    <b className="contract-pending">
-                      {selectedPayment.status === 'under_review'
+                  <DetailItem
+                    label="Status"
+                    value={
+                      selectedPayment.status === 'under_review'
                         ? 'Em análise'
-                        : 'Pendente'}
-                    </b>
-                  </div>
+                        : 'Pendente'
+                    }
+                  />
                 </div>
               </div>
 
@@ -1242,17 +1829,17 @@ export default function AdminApp() {
                 <textarea
                   id="payment-rejection-reason"
                   value={paymentRejectionReason}
-                  onChange={event => setPaymentRejectionReason(event.target.value)}
+                  onChange={event =>
+                    setPaymentRejectionReason(event.target.value)
+                  }
                   rows="3"
                   maxLength={2000}
                   placeholder="Descreva o motivo da rejeição..."
                 />
               </div>
-
             </div>
 
             <div className="contract-modal-actions">
-
               <button
                 className="contract-reject-button"
                 onClick={() => decidePayment('reject')}
@@ -1270,14 +1857,10 @@ export default function AdminApp() {
                 <Check size={16} />
                 {busy ? 'Processando...' : 'Confirmar pagamento'}
               </button>
-
             </div>
-
           </section>
-
         </div>
       )}
-
     </main>
   )
 }
