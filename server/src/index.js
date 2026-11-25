@@ -11,6 +11,7 @@ import billingRoutes from './routes/billing.js'
 import licenseRoutes from './routes/licenses.js'
 
 const app = express()
+app.set('trust proxy', 1)
 const port = Number(process.env.PORT || 3333)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 app.disable('x-powered-by')
