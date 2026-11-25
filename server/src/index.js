@@ -1,30 +1,198 @@
+
 import 'dotenv/config'
+
 import express from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
 import rateLimit from 'express-rate-limit'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+
 import adminRoutes from './routes/admin.js'
+import customerRoutes from './routes/customers.js'
+import contractRoutes from './routes/contracts.js'
 import publicRoutes from './routes/public.js'
 import billingRoutes from './routes/billing.js'
 import licenseRoutes from './routes/licenses.js'
 
+import { supabase } from './supabase.js'
+
+// ==========================================
+// CONFIGURAÇÃO DA APLICAÇÃO
+// ==========================================
+
 const app = express()
-app.set('trust proxy', 1)
 const port = Number(process.env.PORT || 3333)
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+app.set('trust proxy', 1)
 app.disable('x-powered-by')
-app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }))
-app.use(cors({ origin: (process.env.WEB_ORIGIN || 'http://localhost:5173').split(',').map(s => s.trim()), methods: ['GET','POST'], allowedHeaders: ['Content-Type','Authorization'] }))
-app.use(express.json({ limit: '1mb' }))
-app.use('/api/admin/login', rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false }))
-app.get('/api/health', (_req,res)=>res.json({status:'ok',service:'FOODCORE API'}))
+
+// ==========================================
+// SEGURANÇA HTTP
+// ==========================================
+
+app.use(
+  helmet({
+    crossOriginResourcePolicy: {
+      policy: 'cross-origin'
+    }
+  })
+)
+
+// ==========================================
+// CONFIGURAÇÃO CORS
+// ==========================================
+
+const allowedOrigins = (
+  process.env.WEB_ORIGIN || 'http://localhost:5173'
+)
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean)
+
+app.use(
+  cors({
+    origin: allowedOrigins,
+    methods: [
+      'GET',
+      'POST',
+      'PUT',
+      'PATCH',
+      'DELETE',
+      'OPTIONS'
+    ],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization'
+    ],
+    optionsSuccessStatus: 204
+  })
+)
+
+// ==========================================
+// PROCESSAMENTO DE REQUISIÇÕES
+// ==========================================
+
+app.use(
+  express.json({
+    limit: '1mb'
+  })
+)
+
+// ==========================================
+// LIMITAÇÃO DE TENTATIVAS ADMINISTRATIVAS
+// ==========================================
+
+const adminLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: {
+    error: 'Muitas tentativas de login. Tente novamente mais tarde.'
+  }
+})
+
+app.use('/api/admin/login', adminLoginLimiter)
+
+// ==========================================
+// ROTAS DE SAÚDE DA API
+// ==========================================
+
+app.get('/api/health', (_req, res) => {
+  return res.json({
+    status: 'ok',
+    service: 'FOODCORE API'
+  })
+})
+
+app.get('/api/health/database', async (_req, res) => {
+  if (!supabase) {
+    return res.status(503).json({
+      status: 'error',
+      message: 'Database not configured'
+    })
+  }
+
+  try {
+    const { error } = await supabase
+      .from('companies')
+      .select('id')
+      .limit(1)
+
+    if (error) {
+      console.error(
+        '[FOODCORE] Supabase health check failed:',
+        error.message
+      )
+
+      return res.status(503).json({
+        status: 'error',
+        message: 'Database connection failed'
+      })
+    }
+
+    return res.json({
+      status: 'ok',
+      database: 'connected'
+    })
+  } catch (error) {
+    console.error(
+      '[FOODCORE] Supabase connection error:',
+      error.message
+    )
+
+    return res.status(503).json({
+      status: 'error',
+      message: 'Database connection failed'
+    })
+  }
+})
+
+// ==========================================
+// ROTAS PRINCIPAIS
+// ==========================================
+
 app.use('/api/admin', adminRoutes)
+app.use('/api/customers', customerRoutes)
+app.use('/api/contracts', contractRoutes)
 app.use('/api', publicRoutes)
 app.use('/api/billing', billingRoutes)
 app.use('/api/licenses', licenseRoutes)
-app.use((err, _req, res, _next) => { console.error(err); res.status(err.status || 400).json({ error: err.message || 'Erro interno.' }) })
+
+// ==========================================
+// ROTA PARA ENDEREÇOS NÃO ENCONTRADOS
+// ==========================================
+
+app.use((req, res) => {
+  return res.status(404).json({
+    error: 'Rota não encontrada.'
+  })
+})
+
+// ==========================================
+// TRATAMENTO GLOBAL DE ERROS
+// ==========================================
+
+app.use((err, _req, res, _next) => {
+  console.error('[FOODCORE API ERROR]', err)
+
+  const statusCode = Number(err.status) || 500
+
+  return res.status(statusCode).json({
+    error: statusCode >= 500
+      ? 'Erro interno do servidor.'
+      : err.message || 'Erro na requisição.'
+  })
+})
+
+// ==========================================
+// INICIALIZAÇÃO DO SERVIDOR
+// ==========================================
+
 app.listen(port, '0.0.0.0', () => {
-  console.log(`FOODCORE API executando na porta ${port}`)
+  console.log('================================')
+  console.log('FOODCORE API')
+  console.log(`Porta: ${port}`)
+  console.log(`Ambiente: ${process.env.NODE_ENV || 'development'}`)
+  console.log('Servidor iniciado com sucesso.')
+  console.log('================================')
 })
