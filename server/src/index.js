@@ -26,31 +26,56 @@ app.set('trust proxy', 1)
 app.disable('x-powered-by')
 
 // ==========================================
-// SEGURANÇA HTTP
-// ==========================================
-
-app.use(
-  helmet({
-    crossOriginResourcePolicy: {
-      policy: 'cross-origin'
-    }
-  })
-)
-
-// ==========================================
 // CONFIGURAÇÃO CORS
 // ==========================================
 
-const allowedOrigins = (
-  process.env.WEB_ORIGIN || 'http://localhost:5173'
-)
+function normalizeOrigin(value) {
+  try {
+    return new URL(value.trim()).origin
+  } catch {
+    return null
+  }
+}
+
+const defaultOrigins = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'https://foodcore-platform.santosmicael638.workers.dev'
+]
+
+const environmentOrigins = (process.env.WEB_ORIGIN || '')
   .split(',')
-  .map(origin => origin.trim())
+  .map(normalizeOrigin)
   .filter(Boolean)
+
+const allowedOrigins = new Set([
+  ...defaultOrigins,
+  ...environmentOrigins
+])
 
 app.use(
   cors({
-    origin: allowedOrigins,
+    origin(origin, callback) {
+      // Permite requisições sem Origin, como chamadas diretas
+      // por ferramentas de servidor e terminal.
+      if (!origin) {
+        return callback(null, true)
+      }
+
+      const normalizedOrigin = normalizeOrigin(origin)
+
+      if (normalizedOrigin && allowedOrigins.has(normalizedOrigin)) {
+        return callback(null, true)
+      }
+
+      console.warn(
+        '[FOODCORE CORS] Origem bloqueada:',
+        origin
+      )
+
+      return callback(new Error('Origem não autorizada pelo CORS.'))
+    },
+
     methods: [
       'GET',
       'POST',
@@ -59,11 +84,25 @@ app.use(
       'DELETE',
       'OPTIONS'
     ],
+
     allowedHeaders: [
       'Content-Type',
       'Authorization'
     ],
+
     optionsSuccessStatus: 204
+  })
+)
+
+// ==========================================
+// SEGURANÇA HTTP
+// ==========================================
+
+app.use(
+  helmet({
+    crossOriginResourcePolicy: {
+      policy: 'cross-origin'
+    }
   })
 )
 
@@ -193,6 +232,12 @@ app.listen(port, '0.0.0.0', () => {
   console.log('FOODCORE API')
   console.log(`Porta: ${port}`)
   console.log(`Ambiente: ${process.env.NODE_ENV || 'development'}`)
+  console.log('Origens autorizadas:')
+
+  for (const origin of allowedOrigins) {
+    console.log(`- ${origin}`)
+  }
+
   console.log('Servidor iniciado com sucesso.')
   console.log('================================')
 })
