@@ -24,7 +24,10 @@ import {
   getCustomerProfile,
   getLatestRelease,
   uploadPaymentReceipt,
-  downloadRelease
+  downloadRelease,
+  getCurrentContract,
+  generateCustomerContract,
+  uploadSignedCustomerContract
 } from '../services/customerApi.js'
 
 // =====================================================
@@ -336,7 +339,7 @@ export function CustomerDashboardPage() {
             diretamente pela plataforma.
           </p>
 
-          {canPay && (
+          {['pending_review', 'awaiting_payment', 'payment_under_review'].includes(customer.registrationStatus) && (
             <a href="/pagamento" className="fc-portal-action">
               Acessar pagamento <ArrowRight size={17} />
             </a>
@@ -425,6 +428,65 @@ export function CustomerPaymentPage() {
   const [sending, setSending] = useState(false)
   const [message, setMessage] = useState('')
   const [uploadError, setUploadError] = useState('')
+  const [contract, setContract] = useState(null)
+  const [contractFile, setContractFile] = useState(null)
+  const [contractLoading, setContractLoading] = useState(false)
+  const [contractBusy, setContractBusy] = useState(false)
+  const [contractMessage, setContractMessage] = useState('')
+  const [contractError, setContractError] = useState('')
+
+  async function refreshContract() {
+    setContractLoading(true)
+    setContractError('')
+    try {
+      const result = await getCurrentContract()
+      setContract(result?.contract || null)
+    } catch (err) {
+      setContractError(err.message || 'Não foi possível consultar o contrato.')
+    } finally {
+      setContractLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    if (customer) refreshContract()
+  }, [customer])
+
+  async function handleGenerateContract() {
+    setContractBusy(true)
+    setContractError('')
+    setContractMessage('')
+    try {
+      const result = await generateCustomerContract()
+      setContractMessage(result.message || 'Contrato gerado. Assine digitalmente e envie o PDF assinado.')
+      await refreshContract()
+    } catch (err) {
+      setContractError(err.message)
+    } finally {
+      setContractBusy(false)
+    }
+  }
+
+  async function handleContractUpload(event) {
+    event.preventDefault()
+    setContractError('')
+    setContractMessage('')
+    if (!contractFile) {
+      setContractError('Selecione o contrato assinado em PDF.')
+      return
+    }
+    setContractBusy(true)
+    try {
+      const result = await uploadSignedCustomerContract(contractFile)
+      setContractMessage(result.message || 'Contrato enviado para análise.')
+      setContractFile(null)
+      await refreshContract()
+    } catch (err) {
+      setContractError(err.message)
+    } finally {
+      setContractBusy(false)
+    }
+  }
 
   if (loading) return <LoadingScreen />
 
@@ -499,6 +561,40 @@ export function CustomerPaymentPage() {
 
             <CreditCard size={23} />
           </div>
+
+          <div className="fc-form-divider"><span>Contrato de prestação de serviços</span></div>
+          <p>Gere o contrato da sua empresa, assine digitalmente e envie o PDF assinado para análise.</p>
+
+          {contractLoading && <PortalMessage type="warning">Consultando situação do contrato...</PortalMessage>}
+          {contract && (
+            <PortalMessage type={contract.status === 'approved' ? 'success' : contract.status === 'rejected' ? 'error' : 'warning'}>
+              Contrato {contract.contract_number || ''}: {({ awaiting_signature: 'aguardando assinatura', awaiting_approval: 'em análise administrativa', approved: 'aprovado', rejected: 'rejeitado' }[contract.status] || contract.status)}
+            </PortalMessage>
+          )}
+          {contractError && <PortalMessage type="error">{contractError}</PortalMessage>}
+          {contractMessage && <PortalMessage type="success">{contractMessage}</PortalMessage>}
+
+          {(!contract || ['rejected', 'awaiting_signature'].includes(contract.status)) && (
+            <button type="button" className="fc-auth-submit" onClick={handleGenerateContract} disabled={contractBusy || contractLoading}>
+              {contractBusy ? 'Preparando contrato...' : contract?.status === 'rejected' ? 'Gerar novo contrato' : 'Gerar e baixar contrato'}
+              {!contractBusy && <FileText size={17} />}
+            </button>
+          )}
+
+          {contract?.status === 'awaiting_signature' && (
+            <form className="fc-payment-form" onSubmit={handleContractUpload}>
+              <label className="fc-upload-area">
+                <UploadCloud size={28} />
+                <strong>{contractFile ? contractFile.name : 'Selecionar contrato assinado'}</strong>
+                <span>Somente PDF — máximo de 10 MB</span>
+                <input type="file" accept=".pdf,application/pdf" onChange={event => setContractFile(event.target.files?.[0] || null)} />
+              </label>
+              <button type="submit" className="fc-auth-submit" disabled={contractBusy || !contractFile}>
+                {contractBusy ? 'Enviando contrato...' : 'Enviar contrato assinado'}
+                {!contractBusy && <ArrowRight size={17} />}
+              </button>
+            </form>
+          )}
 
           {status === 'pending_review' && (
             <PortalMessage type="warning">

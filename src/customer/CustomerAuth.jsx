@@ -16,7 +16,8 @@ import {
 
 import {
   loginCustomer,
-  registerCustomer
+  registerCustomer,
+  getCustomerProfile
 } from '../services/customerApi.js'
 
 // =====================================================
@@ -675,7 +676,15 @@ export function CustomerLoginPage() {
         password
       )
 
-      window.location.href = '/minha-conta'
+      const profileResult = await getCustomerProfile()
+      const customer = profileResult?.customer
+      const isActive =
+        customer?.companyStatus === 'active' &&
+        customer?.registrationStatus === 'active'
+
+      window.location.href = isActive
+        ? '/download'
+        : '/minha-conta'
     } catch (err) {
       setError(
         err.message ||

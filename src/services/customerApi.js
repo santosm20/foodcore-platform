@@ -3,7 +3,7 @@
 // FOODCORE — CUSTOMER API
 // =====================================================
 
-const API_URL = 'https://foodcore-api.onrender.com/api'
+const API_URL = (import.meta.env.VITE_API_URL || 'https://foodcore-api.onrender.com/api').replace(/\/$/, '')
 const API_ORIGIN = API_URL.replace(/\/api\/?$/, '')
 
 const TOKEN_KEY = 'foodcore_customer_token'
@@ -226,6 +226,74 @@ export async function uploadPaymentReceipt(file, paymentMethod) {
   formData.append('payment_method', paymentMethod)
 
   return request('/billing/receipt', {
+    method: 'POST',
+    body: formData
+  })
+}
+
+// =====================================================
+// CONTRATO DO CLIENTE
+// =====================================================
+
+export async function getCurrentContract() {
+  return request('/contracts/current')
+}
+
+export async function generateCustomerContract() {
+  const token = getCustomerToken()
+  if (!token) throw new Error('Sua sessão expirou. Entre novamente.')
+
+  let response
+  try {
+    response = await fetch(buildApiUrl('/contracts/generate'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/pdf, application/json'
+      }
+    })
+  } catch {
+    throw new Error('Não foi possível conectar ao servidor FOODCORE.')
+  }
+
+  if (!response.ok) {
+    const data = await parseResponse(response)
+    if (response.status === 401) clearCustomerSession()
+    throw new Error(getErrorMessage(data, response.status))
+  }
+
+  const blob = await response.blob()
+  if (!blob.size) throw new Error('O contrato gerado está vazio.')
+
+  const disposition = response.headers.get('content-disposition') || ''
+  const match = disposition.match(/filename="?([^";]+)"?/i)
+  const filename = match?.[1] || 'contrato-foodcore.pdf'
+  const objectUrl = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = objectUrl
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000)
+
+  return { success: true, message: 'Contrato gerado e baixado.' }
+}
+
+export async function uploadSignedCustomerContract(file) {
+  if (!(file instanceof File) || file.size <= 0) {
+    throw new Error('Selecione o contrato assinado em PDF.')
+  }
+  if (file.size > 10 * 1024 * 1024) {
+    throw new Error('O contrato ultrapassa o limite de 10 MB.')
+  }
+  if (file.type !== 'application/pdf' || !file.name.toLowerCase().endsWith('.pdf')) {
+    throw new Error('Envie o contrato assinado em formato PDF.')
+  }
+
+  const formData = new FormData()
+  formData.append('contract', file)
+  return request('/contracts/signed', {
     method: 'POST',
     body: formData
   })
