@@ -22,6 +22,9 @@ const ALLOWED_RECEIPT_TYPES = {
   'image/png': 'png'
 }
 
+// 'suspended' é permitido somente para localizar a cobrança no portal
+// e receber um novo comprovante após rejeição. A validação da licença
+// continua recusando assinaturas suspensas.
 const ALLOWED_SUBSCRIPTION_STATUSES = [
   'pending',
   'active',

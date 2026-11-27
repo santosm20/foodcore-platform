@@ -13,14 +13,32 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024
 
 const DEFAULT_MONTHLY_PRICE = 149.90
 
-// Identificação temporária da CONTRATADA.
-// Confirmar razão social e endereço antes do uso comercial.
-
 const CONTRACTOR = {
-  tradeName: 'FOODCORE',
-  cnpj: '37.210.873/0001-39',
-  legalName: 'Razão social a confirmar',
-  address: 'Endereço empresarial a confirmar'
+  tradeName: process.env.FOODCORE_CONTRACTOR_TRADE_NAME || 'FOODCORE',
+  cnpj: process.env.FOODCORE_CONTRACTOR_CNPJ || '',
+  legalName: process.env.FOODCORE_CONTRACTOR_LEGAL_NAME || '',
+  address: process.env.FOODCORE_CONTRACTOR_ADDRESS || ''
+}
+
+const TEST_MODE = process.env.FOODCORE_TEST_MODE === 'true'
+const TEST_COMPANY_CNPJ = String(
+  process.env.FOODCORE_TEST_COMPANY_CNPJ || ''
+).replace(/\D/g, '')
+
+function isAuthorizedTestCompany(company) {
+  const companyCnpj = String(company?.cnpj || '').replace(/\D/g, '')
+
+  return Boolean(
+    TEST_MODE &&
+    TEST_COMPANY_CNPJ &&
+    companyCnpj &&
+    companyCnpj === TEST_COMPANY_CNPJ
+  )
+}
+
+const CONTRACT_STATUS = {
+  AWAITING_SIGNATURE: 'awaiting_signature',
+  AWAITING_APPROVAL: 'awaiting_approval'
 }
 
 // =====================================================
@@ -39,15 +57,23 @@ function formatCurrency(value) {
 }
 
 function formatDate(value = new Date()) {
-  return new Date(value).toLocaleDateString('pt-BR', {
+  const date = new Date(value)
+
+  if (Number.isNaN(date.getTime())) {
+    throw new Error('Data do contrato inválida.')
+  }
+
+  return date.toLocaleDateString('pt-BR', {
     timeZone: 'America/Sao_Paulo'
   })
 }
 
 function formatCompanyAddress(company) {
-  const address = [
+  return [
     clean(company.street),
-    clean(company.number) ? `nº ${clean(company.number)}` : '',
+    clean(company.number)
+      ? `nº ${clean(company.number)}`
+      : '',
     clean(company.complement),
     clean(company.neighborhood),
     clean(company.city),
@@ -55,9 +81,7 @@ function formatCompanyAddress(company) {
     clean(company.postal_code)
       ? `CEP ${clean(company.postal_code)}`
       : ''
-  ].filter(Boolean)
-
-  return address.join(', ')
+  ].filter(Boolean).join(', ')
 }
 
 // =====================================================
@@ -71,34 +95,21 @@ function validateCompanyAndContract(company, contract) {
     )
   }
 
-  if (!clean(company.legal_name)) {
-    throw new Error(
-      'Razão social da empresa não informada.'
-    )
-  }
+  const requiredCompanyFields = [
+    ['legal_name', 'Razão social da empresa'],
+    ['cnpj', 'CNPJ da empresa'],
+    ['representative_name', 'Representante legal'],
+    ['representative_cpf', 'CPF do representante']
+  ]
 
-  if (!clean(company.cnpj)) {
-    throw new Error(
-      'CNPJ da empresa não informado.'
-    )
-  }
-
-  if (!clean(company.representative_name)) {
-    throw new Error(
-      'Representante legal não informado.'
-    )
-  }
-
-  if (!clean(company.representative_cpf)) {
-    throw new Error(
-      'CPF do representante não informado.'
-    )
+  for (const [field, label] of requiredCompanyFields) {
+    if (!clean(company[field])) {
+      throw new Error(`${label} não informado.`)
+    }
   }
 
   if (!clean(contract.id) || !clean(contract.contract_number)) {
-    throw new Error(
-      'Dados do contrato incompletos.'
-    )
+    throw new Error('Dados do contrato incompletos.')
   }
 
   const price = Number(
@@ -106,9 +117,35 @@ function validateCompanyAndContract(company, contract) {
   )
 
   if (!Number.isFinite(price) || price <= 0) {
+    throw new Error('Valor mensal do contrato inválido.')
+  }
+
+  if (!clean(formatCompanyAddress(company))) {
+    throw new Error('Endereço da empresa não informado.')
+  }
+}
+
+function validateContractor(company) {
+  if (isAuthorizedTestCompany(company)) {
+    return
+  }
+
+  const legalName = clean(CONTRACTOR.legalName)
+  const address = clean(CONTRACTOR.address)
+
+  if (
+    !legalName ||
+    !address ||
+    /a confirmar|a definir|preencher/i.test(legalName) ||
+    /a confirmar|a definir|preencher/i.test(address)
+  ) {
     throw new Error(
-      'Valor mensal do contrato inválido.'
+      'Configure os dados oficiais da CONTRATADA antes de gerar contratos reais.'
     )
+  }
+
+  if (!clean(CONTRACTOR.cnpj)) {
+    throw new Error('CNPJ da CONTRATADA não informado.')
   }
 }
 
@@ -169,11 +206,78 @@ function addFooter(doc) {
 }
 
 // =====================================================
+// CLÁUSULAS CONTRATUAIS
+// =====================================================
+
+function getContractClauses(monthlyPrice) {
+  return [
+    {
+      title: '2. OBJETO',
+      paragraphs: [
+        'O presente contrato tem por objeto a concessão de licença de uso não exclusiva, pessoal e intransferível do software FOODCORE, destinado à gestão operacional e administrativa de estabelecimentos do segmento de alimentação, conforme as funcionalidades disponibilizadas no plano contratado.',
+        'A licença será vinculada à empresa CONTRATANTE e utilizada de acordo com as condições técnicas e comerciais estabelecidas pela CONTRATADA.'
+      ]
+    },
+    {
+      title: '3. VALOR E FORMA DE PAGAMENTO',
+      paragraphs: [
+        `Pela utilização do software, a CONTRATANTE pagará o valor mensal de ${formatCurrency(monthlyPrice)}, mediante PIX ou transferência bancária, conforme as instruções fornecidas pela CONTRATADA.`,
+        'O pagamento será considerado efetivado somente após a identificação e aprovação pela CONTRATADA. O envio do comprovante não representa, isoladamente, confirmação de quitação.'
+      ]
+    },
+    {
+      title: '4. VIGÊNCIA E RENOVAÇÃO',
+      paragraphs: [
+        'A licença terá vigência mensal, com renovação condicionada à confirmação do pagamento correspondente ao período contratado.',
+        'A data de vencimento será estabelecida no cadastro da assinatura, observadas as regras de cobrança informadas pela CONTRATADA.'
+      ]
+    },
+    {
+      title: '5. INADIMPLÊNCIA E SUSPENSÃO',
+      paragraphs: [
+        'Em caso de atraso no pagamento, será concedido prazo de tolerância de 5 (cinco) dias corridos após a data de vencimento.',
+        'Persistindo a inadimplência após o prazo de tolerância, o acesso ao software poderá ser suspenso até a regularização financeira.',
+        'A suspensão do acesso não implica exclusão automática dos dados da CONTRATANTE.'
+      ]
+    },
+    {
+      title: '6. RESPONSABILIDADES DA CONTRATANTE',
+      paragraphs: [
+        'A CONTRATANTE é responsável pela veracidade e atualização dos dados cadastrais fornecidos, pela guarda de suas credenciais de acesso e pela utilização adequada do software.',
+        'A CONTRATANTE deverá impedir o compartilhamento indevido de credenciais e comunicar à CONTRATADA qualquer suspeita de acesso não autorizado.'
+      ]
+    },
+    {
+      title: '7. RESPONSABILIDADES DA CONTRATADA',
+      paragraphs: [
+        'A CONTRATADA deverá empregar medidas razoáveis de segurança para proteger os dados e as informações armazenadas na plataforma.',
+        'A CONTRATADA deverá disponibilizar o software conforme as condições técnicas e comerciais contratadas, ressalvadas manutenções, atualizações e situações de indisponibilidade fora de seu controle razoável.'
+      ]
+    },
+    {
+      title: '8. PROTEÇÃO DE DADOS',
+      paragraphs: [
+        'As partes comprometem-se a observar a legislação aplicável de proteção de dados pessoais, especialmente a Lei nº 13.709/2018 (Lei Geral de Proteção de Dados Pessoais - LGPD).',
+        'Os dados pessoais deverão ser utilizados apenas para finalidades legítimas relacionadas à execução deste contrato, observados os princípios e as obrigações legais aplicáveis.'
+      ]
+    },
+    {
+      title: '9. DISPOSIÇÕES GERAIS',
+      paragraphs: [
+        'A CONTRATANTE declara que leu e compreendeu as condições deste instrumento, comprometendo-se a cumprir suas disposições.',
+        'Qualquer alteração das condições comerciais ou contratuais deverá ser formalizada entre as partes.'
+      ]
+    }
+  ]
+}
+
+// =====================================================
 // GERAÇÃO DO CONTRATO
 // =====================================================
 
 export async function generateContractPdf(company, contract) {
   validateCompanyAndContract(company, contract)
+  validateContractor(company)
 
   const monthlyPrice = Number(
     contract.monthly_price ?? DEFAULT_MONTHLY_PRICE
@@ -181,8 +285,8 @@ export async function generateContractPdf(company, contract) {
 
   const companyName = clean(company.legal_name)
   const representativeName = clean(company.representative_name)
-  const address = formatCompanyAddress(company)
-
+  const representativeCpf = clean(company.representative_cpf)
+  const companyAddress = formatCompanyAddress(company)
   const documentDate = formatDate()
 
   return new Promise((resolve, reject) => {
@@ -199,7 +303,9 @@ export async function generateContractPdf(company, contract) {
       bufferPages: true,
       info: {
         Title: 'Contrato de Prestação de Serviços e Licença de Uso FOODCORE',
-        Author: 'FOODCORE',
+        Author: isAuthorizedTestCompany(company)
+          ? 'FOODCORE — AMBIENTE DE TESTES'
+          : CONTRACTOR.tradeName,
         Subject: 'Contrato de licença de uso de software',
         Creator: 'FOODCORE'
       }
@@ -263,6 +369,17 @@ export async function generateContractPdf(company, contract) {
 
       doc.moveDown(1.5)
 
+      if (isAuthorizedTestCompany(company)) {
+        doc
+          .font('Helvetica-Bold')
+          .fontSize(12)
+          .fillColor('#B42318')
+          .text('DOCUMENTO DE TESTE — SEM VALIDADE JURÍDICA', {
+            align: 'center'
+          })
+        doc.moveDown(1)
+      }
+
       addParagraph(
         doc,
         `CONTRATO Nº: ${clean(contract.contract_number)}`,
@@ -283,77 +400,20 @@ export async function generateContractPdf(company, contract) {
 
       addParagraph(
         doc,
-        `CONTRATANTE: ${companyName}, pessoa jurídica inscrita no CNPJ sob nº ${clean(company.cnpj)}, com sede em ${address || 'endereço não informado'}, neste ato representada por ${representativeName}, CPF nº ${clean(company.representative_cpf)}.`
+        `CONTRATANTE: ${companyName}, pessoa jurídica inscrita no CNPJ sob nº ${clean(company.cnpj)}, com sede em ${companyAddress}, neste ato representada por ${representativeName}, CPF nº ${representativeCpf}.`
       )
 
-      addParagraph(
-        doc,
-        `CONTRATADA: ${CONTRACTOR.tradeName}, inscrita no CNPJ sob nº ${CONTRACTOR.cnpj}, razão social ${CONTRACTOR.legalName}, com endereço em ${CONTRACTOR.address}.`
-      )
+      const contractorIdentification = isAuthorizedTestCompany(company)
+        ? 'CONTRATADA: FOODCORE — AMBIENTE DE TESTES. Os dados cadastrais da fornecedora não estão configurados neste documento fictício, que se destina exclusivamente à validação técnica do fluxo e não possui validade jurídica.'
+        : `CONTRATADA: ${CONTRACTOR.tradeName}, inscrita no CNPJ sob nº ${CONTRACTOR.cnpj}, razão social ${CONTRACTOR.legalName}, com endereço em ${CONTRACTOR.address}.`
+
+      addParagraph(doc, contractorIdentification)
 
       // -------------------------------------------------
-      // CLÁUSULAS CONTRATUAIS
+      // CLÁUSULAS
       // -------------------------------------------------
 
-      const clauses = [
-        {
-          title: '2. OBJETO',
-          paragraphs: [
-            'O presente contrato tem por objeto a concessão de licença de uso não exclusiva, pessoal e intransferível do software FOODCORE, destinado à gestão operacional e administrativa de estabelecimentos do segmento de alimentação, conforme as funcionalidades disponibilizadas no plano contratado.',
-            'A licença será vinculada à empresa CONTRATANTE e utilizada de acordo com as condições técnicas e comerciais estabelecidas pela CONTRATADA.'
-          ]
-        },
-        {
-          title: '3. VALOR E FORMA DE PAGAMENTO',
-          paragraphs: [
-            `Pela utilização do software, a CONTRATANTE pagará o valor mensal de ${formatCurrency(monthlyPrice)}, mediante PIX ou transferência bancária, conforme as instruções fornecidas pela CONTRATADA.`,
-            'O pagamento será considerado efetivado somente após a identificação e aprovação pela CONTRATADA. O envio do comprovante não representa, isoladamente, confirmação de quitação.'
-          ]
-        },
-        {
-          title: '4. VIGÊNCIA E RENOVAÇÃO',
-          paragraphs: [
-            'A licença terá vigência mensal, com renovação condicionada à confirmação do pagamento correspondente ao período contratado.',
-            'A data de vencimento será estabelecida no cadastro da assinatura, observadas as regras de cobrança informadas pela CONTRATADA.'
-          ]
-        },
-        {
-          title: '5. INADIMPLÊNCIA E SUSPENSÃO',
-          paragraphs: [
-            'Em caso de atraso no pagamento, será concedido prazo de tolerância de 5 (cinco) dias corridos após a data de vencimento.',
-            'Persistindo a inadimplência após o prazo de tolerância, o acesso ao software poderá ser suspenso até a regularização financeira.',
-            'A suspensão do acesso não implica exclusão automática dos dados da CONTRATANTE.'
-          ]
-        },
-        {
-          title: '6. RESPONSABILIDADES DA CONTRATANTE',
-          paragraphs: [
-            'A CONTRATANTE é responsável pela veracidade e atualização dos dados cadastrais fornecidos, pela guarda de suas credenciais de acesso e pela utilização adequada do software.',
-            'A CONTRATANTE deverá impedir o compartilhamento indevido de credenciais e comunicar à CONTRATADA qualquer suspeita de acesso não autorizado.'
-          ]
-        },
-        {
-          title: '7. RESPONSABILIDADES DA CONTRATADA',
-          paragraphs: [
-            'A CONTRATADA deverá empregar medidas razoáveis de segurança para proteger os dados e as informações armazenadas na plataforma.',
-            'A CONTRATADA deverá disponibilizar o software conforme as condições técnicas e comerciais contratadas, ressalvadas manutenções, atualizações e situações de indisponibilidade fora de seu controle razoável.'
-          ]
-        },
-        {
-          title: '8. PROTEÇÃO DE DADOS',
-          paragraphs: [
-            'As partes comprometem-se a observar a legislação aplicável de proteção de dados pessoais, especialmente a Lei nº 13.709/2018 (Lei Geral de Proteção de Dados Pessoais - LGPD).',
-            'Os dados pessoais deverão ser utilizados apenas para finalidades legítimas relacionadas à execução deste contrato, observados os princípios e as obrigações legais aplicáveis.'
-          ]
-        },
-        {
-          title: '9. DISPOSIÇÕES GERAIS',
-          paragraphs: [
-            'A CONTRATANTE declara que leu e compreendeu as condições deste instrumento, comprometendo-se a cumprir suas disposições.',
-            'Qualquer alteração das condições comerciais ou contratuais deverá ser formalizada entre as partes.'
-          ]
-        }
-      ]
+      const clauses = getContractClauses(monthlyPrice)
 
       for (const clause of clauses) {
         addSectionTitle(doc, clause.title)
@@ -406,25 +466,7 @@ export async function generateContractPdf(company, contract) {
         })
 
       // -------------------------------------------------
-      // AVISO CONTRATUAL
-      // -------------------------------------------------
-
-      doc.moveDown(2)
-
-      doc
-        .font('Helvetica')
-        .fontSize(8)
-        .fillColor('#777777')
-        .text(
-          'Identificação empresarial da CONTRATADA informada provisoriamente. Os dados cadastrais deverão ser confirmados antes da utilização comercial definitiva deste instrumento.',
-          {
-            align: 'center',
-            lineGap: 3
-          }
-        )
-
-      // -------------------------------------------------
-      // RODAPÉ DAS PÁGINAS
+      // RODAPÉ
       // -------------------------------------------------
 
       const pageRange = doc.bufferedPageRange()
@@ -446,35 +488,31 @@ export async function generateContractPdf(company, contract) {
       try {
         doc.destroy()
       } catch {
-        // O documento já pode estar encerrado.
+        // Documento já encerrado.
       }
     }
   })
 }
 
 // =====================================================
-// VALIDAÇÃO DO PDF
+// VALIDAÇÃO ESTRUTURAL DO PDF
 // =====================================================
 
 function validatePdf(buffer) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 8) {
-    throw new Error(
-      'Arquivo PDF inválido ou vazio.'
-    )
+    throw new Error('Arquivo PDF inválido ou vazio.')
   }
 
   if (buffer.length > MAX_FILE_SIZE) {
-    throw new Error(
-      'O arquivo ultrapassa o limite de 10 MB.'
-    )
+    throw new Error('O arquivo ultrapassa o limite de 10 MB.')
   }
 
-  const header = buffer.subarray(0, 5).toString('ascii')
+  const header = buffer
+    .subarray(0, 5)
+    .toString('ascii')
 
   if (header !== '%PDF-') {
-    throw new Error(
-      'O arquivo enviado não é um PDF válido.'
-    )
+    throw new Error('O arquivo enviado não é um PDF válido.')
   }
 
   const tail = buffer
@@ -482,9 +520,7 @@ function validatePdf(buffer) {
     .toString('latin1')
 
   if (!tail.includes('%%EOF')) {
-    throw new Error(
-      'O PDF não possui marcador de encerramento.'
-    )
+    throw new Error('O PDF não possui marcador de encerramento.')
   }
 
   return true
@@ -521,30 +557,22 @@ export async function uploadSignedContract(
   file
 ) {
   if (!supabase) {
-    throw new Error(
-      'Supabase não configurado.'
-    )
+    throw new Error('Supabase não configurado.')
   }
 
   if (!companyId || !contractId) {
-    throw new Error(
-      'Empresa ou contrato não informado.'
-    )
+    throw new Error('Empresa ou contrato não informado.')
   }
 
   if (!file?.buffer) {
-    throw new Error(
-      'Arquivo não informado.'
-    )
+    throw new Error('Arquivo não informado.')
   }
 
   if (
     file.mimetype !== 'application/pdf' ||
-    !file.originalname?.toLowerCase().endsWith('.pdf')
+    !/\.pdf$/i.test(file.originalname || '')
   ) {
-    throw new Error(
-      'Envie um arquivo PDF válido.'
-    )
+    throw new Error('Envie um arquivo PDF válido.')
   }
 
   validatePdf(file.buffer)
@@ -562,7 +590,7 @@ export async function uploadSignedContract(
   ].join('/')
 
   // ---------------------------------------------------
-  // UPLOAD PARA O STORAGE PRIVADO
+  // ARMAZENAMENTO PRIVADO
   // ---------------------------------------------------
 
   const { error: uploadError } = await supabase.storage
@@ -578,43 +606,52 @@ export async function uploadSignedContract(
   }
 
   // ---------------------------------------------------
-  // ATUALIZAÇÃO DO CONTRATO
+  // ATUALIZAÇÃO CONDICIONAL DO CONTRATO
   // ---------------------------------------------------
 
-  const {
-    data,
-    error: updateError
-  } = await supabase
-    .from('contracts')
-    .update({
-      signed_file_path: filePath,
-      signed_at: new Date().toISOString(),
-      status: 'awaiting_approval'
-    })
-    .eq('id', contractId)
-    .eq('company_id', companyId)
-    .eq('status', 'awaiting_signature')
-    .select(`
-      id,
-      contract_number,
-      status,
-      signed_at
-    `)
-    .maybeSingle()
+  let data
 
-  if (updateError || !data) {
+  try {
+    const result = await supabase
+      .from('contracts')
+      .update({
+        signed_file_path: filePath,
+        signed_at: new Date().toISOString(),
+        status: CONTRACT_STATUS.AWAITING_APPROVAL
+      })
+      .eq('id', contractId)
+      .eq('company_id', companyId)
+      .eq('status', CONTRACT_STATUS.AWAITING_SIGNATURE)
+      .select(`
+        id,
+        contract_number,
+        status,
+        signed_at
+      `)
+      .maybeSingle()
+
+    if (result.error) {
+      throw result.error
+    }
+
+    data = result.data
+
+    if (!data) {
+      throw new Error(
+        'O contrato não está mais aguardando assinatura.'
+      )
+    }
+
+  } catch (error) {
     await removeStorageFile(filePath)
-
-    throw updateError || new Error(
-      'O contrato não está mais aguardando assinatura.'
-    )
+    throw error
   }
 
   return {
     ...data,
     signatureVerification: 'manual_required',
     manualVerificationRequired: true,
-    message: 'Contrato recebido e aguardando análise do administrador.'
+    message: 'Contrato recebido e aguardando análise administrativa da assinatura digital.'
   }
 }
 
@@ -624,15 +661,11 @@ export async function uploadSignedContract(
 
 export async function getContractFile(path) {
   if (!supabase) {
-    throw new Error(
-      'Supabase não configurado.'
-    )
+    throw new Error('Supabase não configurado.')
   }
 
   if (!path || typeof path !== 'string') {
-    throw new Error(
-      'Caminho do contrato inválido.'
-    )
+    throw new Error('Caminho do contrato inválido.')
   }
 
   const normalizedPath = path.trim()
@@ -642,9 +675,7 @@ export async function getContractFile(path) {
     normalizedPath.includes('..') ||
     normalizedPath.includes('\\')
   ) {
-    throw new Error(
-      'Caminho do contrato inválido.'
-    )
+    throw new Error('Caminho do contrato inválido.')
   }
 
   const { data, error } = await supabase.storage
@@ -656,12 +687,14 @@ export async function getContractFile(path) {
   }
 
   if (!data) {
-    throw new Error(
-      'Arquivo do contrato não encontrado.'
-    )
+    throw new Error('Arquivo do contrato não encontrado.')
   }
 
-  return Buffer.from(
+  const buffer = Buffer.from(
     await data.arrayBuffer()
   )
+
+  validatePdf(buffer)
+
+  return buffer
 }

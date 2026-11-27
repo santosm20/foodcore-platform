@@ -1,7 +1,7 @@
 
-import React, { useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
+
 import {
-  Activity,
   ArrowLeft,
   CheckCircle2,
   CloudUpload,
@@ -21,7 +21,6 @@ import {
   Users,
   Link2,
   Copy,
-  ExternalLink,
   UserRound,
   MapPin,
   CalendarDays
@@ -29,7 +28,31 @@ import {
 
 import './admin.css'
 
+// =====================================================
+// CONFIGURAÇÕES
+// =====================================================
+
 const API = 'https://foodcore-api.onrender.com/api'
+
+const REGISTRATION_STATUS = {
+  PENDING_REVIEW: 'pending_review',
+  AWAITING_CONTRACT: 'awaiting_contract',
+  CONTRACT_APPROVED: 'contract_approved',
+  AWAITING_PAYMENT: 'awaiting_payment',
+  PAYMENT_UNDER_REVIEW: 'payment_under_review',
+  ACTIVE: 'active',
+  REJECTED: 'rejected',
+  SUSPENDED: 'suspended'
+}
+
+const PAYMENT_LINK_ALLOWED_STATUSES = [
+  REGISTRATION_STATUS.CONTRACT_APPROVED,
+  REGISTRATION_STATUS.AWAITING_PAYMENT
+]
+
+// =====================================================
+// FUNÇÕES AUXILIARES
+// =====================================================
 
 function formatCurrency(value) {
   return Number(value || 0).toLocaleString('pt-BR', {
@@ -87,6 +110,27 @@ function getErrorMessage(error, fallback) {
   return error?.message || fallback
 }
 
+function getRegistrationStatusLabel(status) {
+  const labels = {
+    pending_review: 'Aguardando análise cadastral',
+    awaiting_contract: 'Aguardando contrato assinado',
+    contract_approved: 'Contrato aprovado',
+    awaiting_payment: 'Aguardando pagamento',
+    payment_under_review: 'Pagamento em análise',
+    active: 'Ativo',
+    rejected: 'Rejeitado',
+    suspended: 'Suspenso'
+  }
+
+  return labels[status] || status || 'Não informado'
+}
+
+function canReleasePaymentLink(company) {
+  return PAYMENT_LINK_ALLOWED_STATUSES.includes(
+    company?.registration_status
+  )
+}
+
 function DetailItem({ label, value }) {
   return (
     <div>
@@ -96,9 +140,13 @@ function DetailItem({ label, value }) {
   )
 }
 
+// =====================================================
+// COMPONENTE PRINCIPAL
+// =====================================================
+
 export default function AdminApp() {
   const [token, setToken] = useState(
-    sessionStorage.getItem('foodcore_admin_token') || ''
+    () => sessionStorage.getItem('foodcore_admin_token') || ''
   )
 
   const [email, setEmail] = useState('')
@@ -117,6 +165,8 @@ export default function AdminApp() {
   const [messageType, setMessageType] = useState('success')
 
   const [busy, setBusy] = useState(false)
+
+  const [loadingReleases, setLoadingReleases] = useState(false)
   const [loadingContracts, setLoadingContracts] = useState(false)
   const [loadingPayments, setLoadingPayments] = useState(false)
   const [loadingCustomers, setLoadingCustomers] = useState(false)
@@ -127,17 +177,27 @@ export default function AdminApp() {
 
   const [customerSubscriptions, setCustomerSubscriptions] = useState([])
   const [customerPaymentLink, setCustomerPaymentLink] = useState('')
+
   const [loadingCustomerDetails, setLoadingCustomerDetails] = useState(false)
 
   const [rejectionReason, setRejectionReason] = useState('')
   const [paymentRejectionReason, setPaymentRejectionReason] = useState('')
+  const [customerRejectionReason, setCustomerRejectionReason] = useState('')
 
-  function showMessage(text, type = 'success') {
+  // =====================================================
+  // MENSAGENS
+  // =====================================================
+
+  const showMessage = useCallback((text, type = 'success') => {
     setMessage(text)
     setMessageType(type)
-  }
+  }, [])
 
-  function logout() {
+  // =====================================================
+  // AUTENTICAÇÃO E REQUISIÇÕES
+  // =====================================================
+
+  const logout = useCallback(() => {
     sessionStorage.removeItem('foodcore_admin_token')
 
     setToken('')
@@ -152,21 +212,27 @@ export default function AdminApp() {
 
     setCustomerSubscriptions([])
     setCustomerPaymentLink('')
-  }
 
-  async function request(path, options = {}) {
+    setMessage('')
+  }, [])
+
+  const request = useCallback(async (path, options = {}) => {
+    const currentToken = sessionStorage.getItem('foodcore_admin_token') || token
+
     const response = await fetch(`${API}${path}`, {
       ...options,
       headers: {
         ...(options.headers || {}),
-        ...(token ? { Authorization: `Bearer ${token}` } : {})
+        ...(currentToken
+          ? { Authorization: `Bearer ${currentToken}` }
+          : {})
       }
     })
 
     const data = await response.json().catch(() => ({}))
 
     if (!response.ok) {
-      if (response.status === 401 && token) {
+      if (response.status === 401 && currentToken) {
         logout()
       }
 
@@ -176,12 +242,14 @@ export default function AdminApp() {
     }
 
     return data
-  }
+  }, [token, logout])
 
   async function downloadFile(path, filename, errorMessage) {
+    const currentToken = sessionStorage.getItem('foodcore_admin_token') || token
+
     const response = await fetch(`${API}${path}`, {
       headers: {
-        Authorization: `Bearer ${token}`
+        Authorization: `Bearer ${currentToken}`
       }
     })
 
@@ -216,11 +284,18 @@ export default function AdminApp() {
   // =====================================================
 
   async function loadReleases() {
+    setLoadingReleases(true)
+
     try {
       const data = await request('/admin/releases')
-      setReleases(data.releases || [])
+      setReleases(Array.isArray(data.releases) ? data.releases : [])
     } catch (error) {
-      showMessage(getErrorMessage(error, 'Erro ao carregar versões.'), 'error')
+      showMessage(
+        getErrorMessage(error, 'Erro ao carregar versões.'),
+        'error'
+      )
+    } finally {
+      setLoadingReleases(false)
     }
   }
 
@@ -229,9 +304,12 @@ export default function AdminApp() {
 
     try {
       const data = await request('/admin/contracts')
-      setContracts(data.contracts || [])
+      setContracts(Array.isArray(data.contracts) ? data.contracts : [])
     } catch (error) {
-      showMessage(getErrorMessage(error, 'Erro ao carregar contratos.'), 'error')
+      showMessage(
+        getErrorMessage(error, 'Erro ao carregar contratos.'),
+        'error'
+      )
     } finally {
       setLoadingContracts(false)
     }
@@ -242,9 +320,12 @@ export default function AdminApp() {
 
     try {
       const data = await request('/admin/payments')
-      setPayments(data.payments || [])
+      setPayments(Array.isArray(data.payments) ? data.payments : [])
     } catch (error) {
-      showMessage(getErrorMessage(error, 'Erro ao carregar pagamentos.'), 'error')
+      showMessage(
+        getErrorMessage(error, 'Erro ao carregar pagamentos.'),
+        'error'
+      )
     } finally {
       setLoadingPayments(false)
     }
@@ -255,9 +336,12 @@ export default function AdminApp() {
 
     try {
       const data = await request('/admin/customers/pending')
-      setCustomers(data.customers || [])
+      setCustomers(Array.isArray(data.customers) ? data.customers : [])
     } catch (error) {
-      showMessage(getErrorMessage(error, 'Erro ao carregar cadastros.'), 'error')
+      showMessage(
+        getErrorMessage(error, 'Erro ao carregar cadastros.'),
+        'error'
+      )
     } finally {
       setLoadingCustomers(false)
     }
@@ -279,11 +363,13 @@ export default function AdminApp() {
   }, [token])
 
   // =====================================================
-  // AUTENTICAÇÃO
+  // LOGIN
   // =====================================================
 
   async function login(event) {
     event.preventDefault()
+
+    if (busy) return
 
     setBusy(true)
     setMessage('')
@@ -295,16 +381,25 @@ export default function AdminApp() {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          email,
+          email: email.trim(),
           password
         })
       })
 
+      if (!data.token) {
+        throw new Error('O servidor não retornou um token de acesso.')
+      }
+
       sessionStorage.setItem('foodcore_admin_token', data.token)
+
       setToken(data.token)
       setPassword('')
+      showMessage('Acesso administrativo autorizado.')
     } catch (error) {
-      showMessage(error.message, 'error')
+      showMessage(
+        getErrorMessage(error, 'Não foi possível realizar o login.'),
+        'error'
+      )
     } finally {
       setBusy(false)
     }
@@ -318,18 +413,26 @@ export default function AdminApp() {
     setSelectedCustomer(customer)
     setCustomerPaymentLink(customer.payment_link || '')
     setCustomerSubscriptions([])
+    setCustomerRejectionReason('')
     setLoadingCustomerDetails(true)
     setMessage('')
 
     try {
       const data = await request(`/admin/customers/${customer.id}`)
 
-      setSelectedCustomer(data.company || customer)
-      setCustomerPaymentLink(data.company?.payment_link || '')
-      setCustomerSubscriptions(data.subscriptions || [])
+      const company = data.company || customer
+
+      setSelectedCustomer(company)
+      setCustomerPaymentLink(company.payment_link || '')
+      setCustomerSubscriptions(
+        Array.isArray(data.subscriptions) ? data.subscriptions : []
+      )
     } catch (error) {
       showMessage(
-        getErrorMessage(error, 'Não foi possível carregar os dados da empresa.'),
+        getErrorMessage(
+          error,
+          'Não foi possível carregar os dados da empresa.'
+        ),
         'error'
       )
     } finally {
@@ -343,17 +446,104 @@ export default function AdminApp() {
     setSelectedCustomer(null)
     setCustomerSubscriptions([])
     setCustomerPaymentLink('')
+    setCustomerRejectionReason('')
+  }
+
+  async function decideCustomer(decision) {
+    if (!selectedCustomer || busy) return
+
+    if (
+      decision === 'approve' &&
+      !window.confirm(
+        'Confirma a aprovação do cadastro? A empresa será liberada para a etapa de geração e assinatura do contrato.'
+      )
+    ) {
+      return
+    }
+
+    if (
+      decision === 'reject' &&
+      customerRejectionReason.trim().length < 5
+    ) {
+      showMessage(
+        'Informe uma justificativa com pelo menos 5 caracteres.',
+        'error'
+      )
+      return
+    }
+
+    setBusy(true)
+    setMessage('')
+
+    try {
+      const data = await request(
+        `/admin/customers/${selectedCustomer.id}/decision`,
+        {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            decision,
+            reason: decision === 'reject'
+              ? customerRejectionReason.trim()
+              : ''
+          })
+        }
+      )
+
+      showMessage(
+        data.message ||
+        (decision === 'approve'
+          ? 'Cadastro aprovado. A empresa poderá seguir para a etapa contratual.'
+          : 'Cadastro rejeitado.')
+      )
+
+      setSelectedCustomer(null)
+      setCustomerSubscriptions([])
+      setCustomerPaymentLink('')
+      setCustomerRejectionReason('')
+
+      await Promise.all([
+        loadCustomers(),
+        loadContracts()
+      ])
+    } catch (error) {
+      showMessage(
+        getErrorMessage(error, 'Não foi possível processar o cadastro.'),
+        'error'
+      )
+    } finally {
+      setBusy(false)
+    }
   }
 
   async function saveCustomerPaymentLink(event) {
     event.preventDefault()
 
-    if (!selectedCustomer) return
+    if (!selectedCustomer || busy) return
+
+    if (!canReleasePaymentLink(selectedCustomer)) {
+      showMessage(
+        'O link de pagamento só pode ser liberado depois da aprovação do contrato assinado.',
+        'error'
+      )
+      return
+    }
 
     const paymentLink = customerPaymentLink.trim()
 
     if (!paymentLink) {
-      return showMessage('Informe o link de pagamento.', 'error')
+      showMessage('Informe o link de pagamento.', 'error')
+      return
+    }
+
+    if (paymentLink.length > 2048) {
+      showMessage(
+        'O link ultrapassa o limite de 2.048 caracteres.',
+        'error'
+      )
+      return
     }
 
     try {
@@ -363,17 +553,11 @@ export default function AdminApp() {
         throw new Error('Protocolo inválido.')
       }
     } catch {
-      return showMessage(
+      showMessage(
         'Informe um endereço válido iniciado por http:// ou https://.',
         'error'
       )
-    }
-
-    if (paymentLink.length > 2048) {
-      return showMessage(
-        'O link ultrapassa o limite de 2.048 caracteres.',
-        'error'
-      )
+      return
     }
 
     setBusy(true)
@@ -397,27 +581,34 @@ export default function AdminApp() {
         data.message || 'Link de pagamento vinculado com sucesso.'
       )
 
-      setSelectedCustomer(current => ({
-        ...current,
-        ...(data.company || {}),
-        payment_link: paymentLink
-      }))
-
-      await loadCustomers()
-
-      // Atualiza os detalhes com o estado mais recente do servidor.
       const refreshed = await request(
         `/admin/customers/${selectedCustomer.id}`
       )
 
-      setSelectedCustomer(refreshed.company || selectedCustomer)
-      setCustomerPaymentLink(
-        refreshed.company?.payment_link || paymentLink
+      const company = refreshed.company || {
+        ...selectedCustomer,
+        payment_link: paymentLink
+      }
+
+      setSelectedCustomer(company)
+      setCustomerPaymentLink(company.payment_link || paymentLink)
+
+      setCustomerSubscriptions(
+        Array.isArray(refreshed.subscriptions)
+          ? refreshed.subscriptions
+          : []
       )
-      setCustomerSubscriptions(refreshed.subscriptions || [])
+
+      await Promise.all([
+        loadCustomers(),
+        loadPayments()
+      ])
     } catch (error) {
       showMessage(
-        getErrorMessage(error, 'Não foi possível vincular o link de pagamento.'),
+        getErrorMessage(
+          error,
+          'Não foi possível vincular o link de pagamento.'
+        ),
         'error'
       )
     } finally {
@@ -446,15 +637,23 @@ export default function AdminApp() {
   async function upload(event) {
     event.preventDefault()
 
+    if (busy) return
+
     if (!file) {
-      return showMessage('Selecione o instalador .exe primeiro.', 'error')
+      showMessage('Selecione o instalador .exe primeiro.', 'error')
+      return
+    }
+
+    if (!version.trim()) {
+      showMessage('Informe a versão do instalador.', 'error')
+      return
     }
 
     const form = new FormData()
 
     form.append('installer', file)
-    form.append('version', version)
-    form.append('notes', notes)
+    form.append('version', version.trim())
+    form.append('notes', notes.trim())
 
     setBusy(true)
     setMessage('')
@@ -465,14 +664,22 @@ export default function AdminApp() {
         body: form
       })
 
-      showMessage(`Versão ${data.release.version} publicada com sucesso.`)
+      showMessage(
+        `Versão ${data.release?.version || version} publicada com sucesso.`
+      )
 
       setFile(null)
+      setVersion('1.0.0')
+      setNotes('')
+
       event.target.reset()
 
       await loadReleases()
     } catch (error) {
-      showMessage(error.message, 'error')
+      showMessage(
+        getErrorMessage(error, 'Não foi possível publicar a versão.'),
+        'error'
+      )
     } finally {
       setBusy(false)
     }
@@ -483,26 +690,31 @@ export default function AdminApp() {
   // =====================================================
 
   async function downloadContract(contract) {
+    if (busy) return
+
     setBusy(true)
     setMessage('')
 
     try {
       await downloadFile(
         `/admin/contracts/${contract.id}/signed/download`,
-        `contrato-assinado-${contract.contract_number}.pdf`,
+        `contrato-assinado-${contract.contract_number || contract.id}.pdf`,
         'Falha ao baixar o contrato.'
       )
 
       showMessage('Download do contrato iniciado.')
     } catch (error) {
-      showMessage(error.message, 'error')
+      showMessage(
+        getErrorMessage(error, 'Falha ao baixar o contrato.'),
+        'error'
+      )
     } finally {
       setBusy(false)
     }
   }
 
   async function decideContract(decision) {
-    if (!selectedContract) return
+    if (!selectedContract || busy) return
 
     if (
       decision === 'approve' &&
@@ -513,11 +725,15 @@ export default function AdminApp() {
       return
     }
 
-    if (decision === 'reject' && rejectionReason.trim().length < 5) {
-      return showMessage(
+    if (
+      decision === 'reject' &&
+      rejectionReason.trim().length < 5
+    ) {
+      showMessage(
         'Informe uma justificativa com pelo menos 5 caracteres.',
         'error'
       )
+      return
     }
 
     setBusy(true)
@@ -533,22 +749,33 @@ export default function AdminApp() {
           },
           body: JSON.stringify({
             decision,
-            reason: decision === 'reject' ? rejectionReason.trim() : ''
+            reason: decision === 'reject'
+              ? rejectionReason.trim()
+              : ''
           })
         }
       )
 
-      showMessage(data.message)
+      showMessage(
+        data.message ||
+        (decision === 'approve'
+          ? 'Contrato aprovado. A empresa poderá receber o link de pagamento.'
+          : 'Contrato rejeitado. O cliente poderá enviar uma versão corrigida.')
+      )
 
       setSelectedContract(null)
       setRejectionReason('')
 
       await Promise.all([
         loadContracts(),
-        loadPayments()
+        loadPayments(),
+        loadCustomers()
       ])
     } catch (error) {
-      showMessage(error.message, 'error')
+      showMessage(
+        getErrorMessage(error, 'Não foi possível processar o contrato.'),
+        'error'
+      )
     } finally {
       setBusy(false)
     }
@@ -559,6 +786,8 @@ export default function AdminApp() {
   // =====================================================
 
   async function downloadPaymentReceipt(payment) {
+    if (busy) return
+
     setBusy(true)
     setMessage('')
 
@@ -571,14 +800,17 @@ export default function AdminApp() {
 
       showMessage('Download do comprovante iniciado.')
     } catch (error) {
-      showMessage(error.message, 'error')
+      showMessage(
+        getErrorMessage(error, 'Falha ao baixar o comprovante.'),
+        'error'
+      )
     } finally {
       setBusy(false)
     }
   }
 
   async function decidePayment(decision) {
-    if (!selectedPayment) return
+    if (!selectedPayment || busy) return
 
     if (
       decision === 'approve' &&
@@ -593,10 +825,11 @@ export default function AdminApp() {
       decision === 'reject' &&
       paymentRejectionReason.trim().length < 5
     ) {
-      return showMessage(
+      showMessage(
         'Informe uma justificativa com pelo menos 5 caracteres.',
         'error'
       )
+      return
     }
 
     setBusy(true)
@@ -619,7 +852,12 @@ export default function AdminApp() {
         }
       )
 
-      showMessage(data.message)
+      showMessage(
+        data.message ||
+        (decision === 'approve'
+          ? 'Pagamento aprovado.'
+          : 'Pagamento rejeitado.')
+      )
 
       setSelectedPayment(null)
       setPaymentRejectionReason('')
@@ -629,7 +867,10 @@ export default function AdminApp() {
         loadCustomers()
       ])
     } catch (error) {
-      showMessage(error.message, 'error')
+      showMessage(
+        getErrorMessage(error, 'Não foi possível processar o pagamento.'),
+        'error'
+      )
     } finally {
       setBusy(false)
     }
@@ -691,7 +932,7 @@ export default function AdminApp() {
                 placeholder="Sua senha"
               />
 
-              <button disabled={busy}>
+              <button type="submit" disabled={busy}>
                 {busy ? 'Entrando...' : 'Entrar no painel'}
               </button>
             </form>
@@ -712,7 +953,7 @@ export default function AdminApp() {
   }
 
   // =====================================================
-  // PAINEL
+  // PAINEL ADMINISTRATIVO
   // =====================================================
 
   return (
@@ -775,7 +1016,7 @@ export default function AdminApp() {
         <section className="admin-stats">
           <article>
             <span><Users /></span>
-            <small>CADASTROS PENDENTES</small>
+            <small>CADASTROS EM ANDAMENTO</small>
             <b>{customers.length}</b>
           </article>
 
@@ -803,10 +1044,11 @@ export default function AdminApp() {
         <section className="admin-panel customer-section">
           <div className="admin-panel-title">
             <div>
-              <h2>Cadastros de clientes</h2>
+              <h2>Cadastros em andamento</h2>
               <p>
-                Analise os dados das empresas e vincule o link externo
-                para pagamento da primeira mensalidade.
+                Acompanhe os cadastros recém-recebidos e as empresas aguardando
+                o envio do contrato assinado. O pagamento só poderá ser
+                disponibilizado após a aprovação do contrato.
               </p>
             </div>
 
@@ -830,7 +1072,7 @@ export default function AdminApp() {
           ) : customers.length === 0 ? (
             <div className="empty-state">
               <Users size={30} />
-              <p>Nenhum cadastro aguardando análise.</p>
+              <p>Nenhum cadastro ou contrato aguardando ação do cliente.</p>
             </div>
           ) : (
             <div className="contract-list">
@@ -853,14 +1095,16 @@ export default function AdminApp() {
                   </div>
 
                   <div className="contract-card-meta">
-                    <span>{customer.email || 'E-mail não informado'}</span>
+                    <span>
+                      {customer.email || 'E-mail não informado'}
+                    </span>
 
                     <span>
                       Cadastro: {formatDate(customer.created_at)}
                     </span>
 
                     <b className="contract-pending">
-                      Aguardando análise
+                      {getRegistrationStatusLabel(customer.registration_status)}
                     </b>
                   </div>
 
@@ -869,7 +1113,9 @@ export default function AdminApp() {
                     onClick={() => openCustomer(customer)}
                   >
                     <Eye size={15} />
-                    Analisar cadastro
+                    {customer.registration_status === REGISTRATION_STATUS.PENDING_REVIEW
+                      ? 'Analisar cadastro'
+                      : 'Acompanhar contrato'}
                   </button>
                 </article>
               ))}
@@ -884,7 +1130,8 @@ export default function AdminApp() {
             <div>
               <h2>Gestão de contratos</h2>
               <p>
-                Analise os documentos enviados pelos clientes.
+                Confira os documentos assinados e valide a assinatura
+                digital antes de liberar o pagamento.
               </p>
             </div>
 
@@ -921,12 +1168,12 @@ export default function AdminApp() {
 
                     <div className="contract-company-info">
                       <h3>
-                        {contract.company?.trade_name ||
-                          contract.company?.legal_name ||
-                          'Empresa não identificada'}
+                        {getCompanyName(contract.company)}
                       </h3>
 
-                      <span>{contract.company?.legal_name}</span>
+                      <span>
+                        {contract.company?.legal_name || '-'}
+                      </span>
 
                       <small>
                         Contrato {contract.contract_number}
@@ -936,7 +1183,7 @@ export default function AdminApp() {
 
                   <div className="contract-card-meta">
                     <span>
-                      {contract.company?.cnpj || 'CNPJ não informado'}
+                      {formatCnpj(contract.company?.cnpj)}
                     </span>
 
                     <span>
@@ -945,7 +1192,9 @@ export default function AdminApp() {
                         : 'Data não informada'}
                     </span>
 
-                    <b>{formatCurrency(contract.monthly_price)}/mês</b>
+                    <b>
+                      {formatCurrency(contract.monthly_price)}/mês
+                    </b>
                   </div>
 
                   <button
@@ -972,6 +1221,7 @@ export default function AdminApp() {
               <h2>Gestão de pagamentos</h2>
               <p>
                 Confira os comprovantes e aprove ou rejeite os pagamentos.
+                A aprovação ativa ou renova a licença do cliente.
               </p>
             </div>
 
@@ -1008,9 +1258,7 @@ export default function AdminApp() {
 
                     <div className="contract-company-info">
                       <h3>
-                        {payment.subscription?.company?.trade_name ||
-                          payment.subscription?.company?.legal_name ||
-                          'Empresa não identificada'}
+                        {getCompanyName(payment.subscription?.company)}
                       </h3>
 
                       <span>
@@ -1075,9 +1323,9 @@ export default function AdminApp() {
               <input
                 type="file"
                 accept=".exe,application/vnd.microsoft.portable-executable"
-                onChange={event =>
+                onChange={event => {
                   setFile(event.target.files?.[0] || null)
-                }
+                }}
                 required
               />
 
@@ -1104,7 +1352,7 @@ export default function AdminApp() {
                 rows="4"
               />
 
-              <button disabled={busy}>
+              <button type="submit" disabled={busy}>
                 {busy ? 'Enviando...' : 'Publicar versão'}
               </button>
             </form>
@@ -1168,13 +1416,21 @@ export default function AdminApp() {
             <button
               className="refresh-button"
               onClick={loadReleases}
+              disabled={loadingReleases}
             >
-              <RefreshCw size={15} />
+              <RefreshCw
+                size={15}
+                className={loadingReleases ? 'admin-spin' : ''}
+              />
               Atualizar
             </button>
           </div>
 
-          {releases.length === 0 ? (
+          {loadingReleases ? (
+            <div className="empty-state">
+              Carregando versões...
+            </div>
+          ) : releases.length === 0 ? (
             <div className="empty-state">
               Nenhum instalador publicado ainda.
             </div>
@@ -1215,7 +1471,9 @@ export default function AdminApp() {
         </footer>
       </div>
 
-      {/* MODAL DE CADASTRO */}
+      {/* =====================================================
+          MODAL DE CADASTRO
+      ===================================================== */}
 
       {selectedCustomer && (
         <div
@@ -1371,15 +1629,9 @@ export default function AdminApp() {
 
                       <DetailItem
                         label="Status cadastral"
-                        value={
-                          selectedCustomer.registration_status === 'awaiting_payment'
-                            ? 'Aguardando pagamento'
-                            : selectedCustomer.registration_status === 'payment_under_review'
-                              ? 'Pagamento em análise'
-                              : selectedCustomer.registration_status === 'active'
-                                ? 'Ativo'
-                                : 'Aguardando análise'
-                        }
+                        value={getRegistrationStatusLabel(
+                          selectedCustomer.registration_status
+                        )}
                       />
 
                       <DetailItem
@@ -1426,91 +1678,191 @@ export default function AdminApp() {
                       <b>Conferência dos dados</b>
                       <p>
                         Confira os dados cadastrais e a identificação
-                        da empresa antes de vincular o pagamento.
+                        da empresa antes de liberar a etapa contratual.
                         O CPF do representante é exibido somente
                         nesta área administrativa.
                       </p>
                     </div>
                   </div>
 
-                  <div className="contract-detail-block">
-                    <h3>
-                      <Link2 size={17} />
-                      Link externo de pagamento
-                    </h3>
+                  {/* ETAPA CADASTRAL */}
 
-                    <p>
-                      Informe o link de cobrança que será disponibilizado
-                      ao cliente no portal FOODCORE.
-                    </p>
+                  {selectedCustomer.registration_status ===
+                    REGISTRATION_STATUS.PENDING_REVIEW && (
+                    <div className="contract-detail-block">
+                      <h3>
+                        <ShieldCheck size={17} />
+                        Decisão cadastral
+                      </h3>
 
-                    <form
-                      className="release-form"
-                      onSubmit={saveCustomerPaymentLink}
-                    >
-                      <label htmlFor="customer-payment-link">
-                        Link de pagamento
-                      </label>
+                      <p>
+                        Após conferir os dados, aprove o cadastro para
+                        permitir que o cliente gere e assine o contrato.
+                        Esta ação não cria cobrança nem ativa a licença.
+                      </p>
 
-                      <input
-                        id="customer-payment-link"
-                        type="url"
-                        value={customerPaymentLink}
-                        onChange={event =>
-                          setCustomerPaymentLink(event.target.value)
-                        }
-                        maxLength={2048}
-                        placeholder="https://..."
-                        required
-                      />
+                      <div className="contract-rejection">
+                        <label htmlFor="customer-rejection-reason">
+                          Justificativa (obrigatória para rejeição)
+                        </label>
 
-                      <small>
-                        Aceita endereços HTTP e HTTPS. O pagamento
-                        é realizado externamente à plataforma.
-                      </small>
-
-                      <button
-                        type="submit"
-                        disabled={busy || loadingCustomerDetails}
-                      >
-                        {busy
-                          ? 'Vinculando...'
-                          : 'Vincular link e gerar cobrança'}
-                      </button>
-                    </form>
-
-                    {selectedCustomer.payment_link && (
-                      <div className="contract-validation-notice">
-                        <CheckCircle2 size={19} />
-
-                        <div>
-                          <b>Link já vinculado</b>
-
-                          <p>
-                            O cadastro está aguardando o pagamento
-                            da primeira mensalidade.
-                          </p>
-
-                          <a
-                            href={selectedCustomer.payment_link}
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            Abrir link de pagamento
-                          </a>
-
-                          <button
-                            type="button"
-                            className="refresh-button"
-                            onClick={copyPaymentLink}
-                          >
-                            <Copy size={15} />
-                            Copiar link
-                          </button>
-                        </div>
+                        <textarea
+                          id="customer-rejection-reason"
+                          value={customerRejectionReason}
+                          onChange={event =>
+                            setCustomerRejectionReason(event.target.value)
+                          }
+                          rows="3"
+                          maxLength={2000}
+                          placeholder="Descreva o motivo da rejeição..."
+                        />
                       </div>
-                    )}
-                  </div>
+
+                      <div className="contract-modal-actions">
+                        <button
+                          type="button"
+                          className="contract-reject-button"
+                          onClick={() => decideCustomer('reject')}
+                          disabled={busy}
+                        >
+                          <X size={16} />
+                          Rejeitar cadastro
+                        </button>
+
+                        <button
+                          type="button"
+                          className="contract-approve-button"
+                          onClick={() => decideCustomer('approve')}
+                          disabled={busy}
+                        >
+                          <Check size={16} />
+                          {busy ? 'Processando...' : 'Aprovar cadastro'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ETAPA DE PAGAMENTO */}
+
+                  {canReleasePaymentLink(selectedCustomer) && (
+                    <div className="contract-detail-block">
+                      <h3>
+                        <Link2 size={17} />
+                        Link externo de pagamento
+                      </h3>
+
+                      <p>
+                        O contrato assinado já foi aprovado. Agora você
+                        pode informar o link da primeira cobrança, que
+                        será disponibilizado ao cliente no portal FOODCORE.
+                      </p>
+
+                      <form
+                        className="release-form"
+                        onSubmit={saveCustomerPaymentLink}
+                      >
+                        <label htmlFor="customer-payment-link">
+                          Link de pagamento
+                        </label>
+
+                        <input
+                          id="customer-payment-link"
+                          type="url"
+                          value={customerPaymentLink}
+                          onChange={event =>
+                            setCustomerPaymentLink(event.target.value)
+                          }
+                          maxLength={2048}
+                          placeholder="https://..."
+                          required
+                        />
+
+                        <small>
+                          Aceita endereços HTTP e HTTPS. O pagamento
+                          é realizado externamente à plataforma.
+                        </small>
+
+                        <button
+                          type="submit"
+                          disabled={busy || loadingCustomerDetails}
+                        >
+                          {busy
+                            ? 'Vinculando...'
+                            : 'Vincular link e gerar cobrança'}
+                        </button>
+                      </form>
+
+                      {selectedCustomer.payment_link && (
+                        <div className="contract-validation-notice">
+                          <CheckCircle2 size={19} />
+
+                          <div>
+                            <b>Link já vinculado</b>
+
+                            <p>
+                              O cliente já pode acessar o link de pagamento
+                              pelo portal FOODCORE.
+                            </p>
+
+                            <a
+                              href={selectedCustomer.payment_link}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              Abrir link de pagamento
+                            </a>
+
+                            <button
+                              type="button"
+                              className="refresh-button"
+                              onClick={copyPaymentLink}
+                            >
+                              <Copy size={15} />
+                              Copiar link
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* SITUAÇÕES EM QUE NÃO SE DEVE LIBERAR PAGAMENTO */}
+
+                  {!canReleasePaymentLink(selectedCustomer) &&
+                    selectedCustomer.registration_status !==
+                      REGISTRATION_STATUS.PENDING_REVIEW && (
+                    <div className="contract-validation-notice">
+                      <ShieldCheck size={19} />
+
+                      <div>
+                        <b>
+                          {selectedCustomer.registration_status ===
+                            REGISTRATION_STATUS.AWAITING_CONTRACT
+                            ? 'Aguardando contrato assinado'
+                            : selectedCustomer.registration_status ===
+                                REGISTRATION_STATUS.PAYMENT_UNDER_REVIEW
+                              ? 'Pagamento em análise'
+                              : selectedCustomer.registration_status ===
+                                  REGISTRATION_STATUS.ACTIVE
+                                ? 'Empresa ativa'
+                                : 'Etapa atual do cadastro'}
+                        </b>
+
+                        <p>
+                          {selectedCustomer.registration_status ===
+                            REGISTRATION_STATUS.AWAITING_CONTRACT
+                            ? 'O cliente precisa gerar o contrato, assinar pelo gov.br e enviar o PDF para análise. O link de pagamento ainda não pode ser liberado.'
+                            : selectedCustomer.registration_status ===
+                                REGISTRATION_STATUS.PAYMENT_UNDER_REVIEW
+                              ? 'O comprovante está aguardando conferência administrativa.'
+                              : selectedCustomer.registration_status ===
+                                  REGISTRATION_STATUS.ACTIVE
+                                ? 'A empresa já possui uma assinatura ativa. Não é necessário liberar a primeira cobrança novamente.'
+                                : 'O link de pagamento não está disponível nesta etapa do processo.'}
+                        </p>
+                      </div>
+                    </div>
+                  )}
                 </>
               )}
             </div>
@@ -1529,7 +1881,9 @@ export default function AdminApp() {
         </div>
       )}
 
-      {/* MODAL DE CONTRATO */}
+      {/* =====================================================
+          MODAL DE CONTRATO
+      ===================================================== */}
 
       {selectedContract && (
         <div
@@ -1547,7 +1901,9 @@ export default function AdminApp() {
                   ANÁLISE DOCUMENTAL
                 </div>
 
-                <h2>Contrato {selectedContract.contract_number}</h2>
+                <h2>
+                  Contrato {selectedContract.contract_number}
+                </h2>
               </div>
 
               <button
@@ -1579,7 +1935,7 @@ export default function AdminApp() {
 
                   <DetailItem
                     label="CNPJ"
-                    value={selectedContract.company?.cnpj}
+                    value={formatCnpj(selectedContract.company?.cnpj)}
                   />
 
                   <DetailItem
@@ -1599,7 +1955,9 @@ export default function AdminApp() {
 
                   <DetailItem
                     label="CPF do representante"
-                    value={formatCpf(selectedContract.company?.representative_cpf)}
+                    value={formatCpf(
+                      selectedContract.company?.representative_cpf
+                    )}
                   />
 
                   <DetailItem
@@ -1697,7 +2055,9 @@ export default function AdminApp() {
         </div>
       )}
 
-      {/* MODAL DE PAGAMENTO */}
+      {/* =====================================================
+          MODAL DE PAGAMENTO
+      ===================================================== */}
 
       {selectedPayment && (
         <div
@@ -1737,7 +2097,9 @@ export default function AdminApp() {
                 <div className="contract-detail-grid">
                   <DetailItem
                     label="Empresa"
-                    value={getCompanyName(selectedPayment.subscription?.company)}
+                    value={getCompanyName(
+                      selectedPayment.subscription?.company
+                    )}
                   />
 
                   <DetailItem
@@ -1747,7 +2109,9 @@ export default function AdminApp() {
 
                   <DetailItem
                     label="CNPJ"
-                    value={selectedPayment.subscription?.company?.cnpj}
+                    value={formatCnpj(
+                      selectedPayment.subscription?.company?.cnpj
+                    )}
                   />
 
                   <DetailItem
@@ -1864,3 +2228,4 @@ export default function AdminApp() {
     </main>
   )
 }
+ 

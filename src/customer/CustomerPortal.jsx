@@ -1,15 +1,14 @@
-
-import React, { useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 
 import {
   ArrowDownToLine,
   ArrowLeft,
   ArrowRight,
+  ArrowUpRight,
   Building2,
   CheckCircle2,
   Clock3,
   CreditCard,
-  FileCheck,
   FileText,
   Headphones,
   LogOut,
@@ -33,6 +32,14 @@ import {
 // =====================================================
 // CONFIGURAÇÕES
 // =====================================================
+
+const MAX_UPLOAD_SIZE = 10 * 1024 * 1024
+
+const PAYMENT_FILE_TYPES = [
+  'application/pdf',
+  'image/jpeg',
+  'image/png'
+]
 
 const STATUS_CONFIG = {
   pending_review: {
@@ -67,8 +74,17 @@ const STATUS_CONFIG = {
   }
 }
 
+const CONTRACT_STATUS_LABELS = {
+  awaiting_signature: 'aguardando assinatura',
+  awaiting_approval: 'em análise administrativa',
+  approved: 'aprovado',
+  rejected: 'rejeitado'
+}
+
+const SUPPORT_URL = 'https://wa.me/5511976977449'
+
 // =====================================================
-// COMPONENTES
+// COMPONENTES COMPARTILHADOS
 // =====================================================
 
 function PortalLayout({ children, customer, title }) {
@@ -90,13 +106,11 @@ function PortalLayout({ children, customer, title }) {
             <span className="fc-portal-avatar">
               {(customer?.fullName || 'C').charAt(0).toUpperCase()}
             </span>
-
-            <span>
-              {customer?.fullName || 'Área do cliente'}
-            </span>
+            <span>{customer?.fullName || 'Área do cliente'}</span>
           </div>
 
           <button
+            type="button"
             className="fc-portal-logout"
             onClick={handleLogout}
             title="Sair da conta"
@@ -126,7 +140,7 @@ function PortalLayout({ children, customer, title }) {
 
 function PortalMessage({ type = 'error', children }) {
   return (
-    <div className={`fc-portal-message fc-message-${type}`}>
+    <div className={`fc-portal-message fc-message-${type}`} role="status">
       {children}
     </div>
   )
@@ -142,8 +156,54 @@ function LoadingScreen() {
   )
 }
 
+function SessionError({ error, title = 'Sessão não encontrada' }) {
+  return (
+    <main className="fc-portal">
+      <div className="fc-portal-empty">
+        <ShieldCheck size={34} />
+        <h2>{title}</h2>
+        <p>{error || 'Entre novamente para continuar.'}</p>
+        <a href="/login" className="fc-auth-submit">
+          Entrar novamente <ArrowRight size={17} />
+        </a>
+      </div>
+    </main>
+  )
+}
+
+function validatePdf(file, label) {
+  if (!(file instanceof File) || file.size <= 0) {
+    throw new Error(`Selecione ${label} em PDF.`)
+  }
+
+  if (file.size > MAX_UPLOAD_SIZE) {
+    throw new Error('O arquivo ultrapassa o limite de 10 MB.')
+  }
+
+  if (
+    file.type !== 'application/pdf' ||
+    !file.name.toLowerCase().endsWith('.pdf')
+  ) {
+    throw new Error('Envie um arquivo PDF válido.')
+  }
+}
+
+function validatePaymentReceipt(file) {
+  if (!(file instanceof File) || file.size <= 0) {
+    throw new Error('Selecione um comprovante válido.')
+  }
+
+  if (file.size > MAX_UPLOAD_SIZE) {
+    throw new Error('O comprovante ultrapassa o limite de 10 MB.')
+  }
+
+  if (!PAYMENT_FILE_TYPES.includes(file.type)) {
+    throw new Error('Envie um comprovante em PDF, JPG ou PNG.')
+  }
+}
+
 // =====================================================
-// AUTENTICAÇÃO E CARREGAMENTO
+// PERFIL DO CLIENTE
 // =====================================================
 
 function useCustomerProfile() {
@@ -151,7 +211,7 @@ function useCustomerProfile() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
-  async function loadProfile() {
+  const loadProfile = useCallback(async () => {
     setLoading(true)
     setError('')
 
@@ -163,31 +223,32 @@ function useCustomerProfile() {
       }
 
       setCustomer(result.customer)
+      return result.customer
     } catch (err) {
-      setError(err.message)
+      const message = err?.message || 'Não foi possível carregar sua conta.'
+      setError(message)
+      setCustomer(null)
 
+      const normalized = message.toLowerCase()
       if (
-        err.message.toLowerCase().includes('token') ||
-        err.message.toLowerCase().includes('sessão') ||
-        err.message.toLowerCase().includes('autenticação')
+        normalized.includes('token') ||
+        normalized.includes('sessão') ||
+        normalized.includes('autenticação')
       ) {
         clearCustomerSession()
       }
+
+      return null
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
 
   useEffect(() => {
     loadProfile()
-  }, [])
+  }, [loadProfile])
 
-  return {
-    customer,
-    loading,
-    error,
-    reload: loadProfile
-  }
+  return { customer, loading, error, reload: loadProfile }
 }
 
 // =====================================================
@@ -195,29 +256,10 @@ function useCustomerProfile() {
 // =====================================================
 
 export function CustomerDashboardPage() {
-  const {
-    customer,
-    loading,
-    error,
-    reload
-  } = useCustomerProfile()
+  const { customer, loading, error, reload } = useCustomerProfile()
 
   if (loading) return <LoadingScreen />
-
-  if (!customer) {
-    return (
-      <main className="fc-portal">
-        <div className="fc-portal-empty">
-          <ShieldCheck size={34} />
-          <h2>Não foi possível acessar sua conta</h2>
-          <p>{error || 'Entre novamente para continuar.'}</p>
-          <a href="/login" className="fc-auth-submit">
-            Ir para o login <ArrowRight size={17} />
-          </a>
-        </div>
-      </main>
-    )
-  }
+  if (!customer) return <SessionError error={error} title="Não foi possível acessar sua conta" />
 
   const status = STATUS_CONFIG[customer.registrationStatus] || {
     title: 'Status não identificado',
@@ -227,17 +269,32 @@ export function CustomerDashboardPage() {
   }
 
   const StatusIcon = status.icon
-
-  const companyName = customer.companyName || customer.fullName
-
-  const canPay = [
-    'awaiting_payment',
-    'payment_under_review'
-  ].includes(customer.registrationStatus)
-
   const isActive =
     customer.companyStatus === 'active' &&
     customer.registrationStatus === 'active'
+
+  const progress = [
+    {
+      label: 'Cadastro recebido',
+      complete: customer.registrationStatus !== 'rejected'
+    },
+    {
+      label: 'Análise administrativa',
+      complete: [
+        'awaiting_payment',
+        'payment_under_review',
+        'active'
+      ].includes(customer.registrationStatus)
+    },
+    {
+      label: 'Pagamento',
+      complete: customer.registrationStatus === 'active'
+    },
+    {
+      label: 'Licença liberada',
+      complete: isActive
+    }
+  ]
 
   return (
     <PortalLayout customer={customer} title="Minha conta">
@@ -248,7 +305,6 @@ export function CustomerDashboardPage() {
               <span className="fc-portal-label">SITUAÇÃO DA EMPRESA</span>
               <h2>Status do cadastro</h2>
             </div>
-
             <span className={`fc-status-icon ${status.color}`}>
               <StatusIcon size={23} />
             </span>
@@ -260,33 +316,12 @@ export function CustomerDashboardPage() {
           </div>
 
           <div className="fc-status-progress">
-            <div className={customer.registrationStatus !== 'rejected' ? 'complete' : ''}>
-              <CheckCircle2 size={17} />
-              <span>Cadastro recebido</span>
-            </div>
-
-            <div className={[
-              'pending_review',
-              'awaiting_payment',
-              'payment_under_review',
-              'active'
-            ].includes(customer.registrationStatus) ? 'complete' : ''}>
-              <CheckCircle2 size={17} />
-              <span>Análise administrativa</span>
-            </div>
-
-            <div className={[
-              'payment_under_review',
-              'active'
-            ].includes(customer.registrationStatus) ? 'complete' : ''}>
-              <CheckCircle2 size={17} />
-              <span>Pagamento</span>
-            </div>
-
-            <div className={isActive ? 'complete' : ''}>
-              <ShieldCheck size={17} />
-              <span>Licença liberada</span>
-            </div>
+            {progress.map(item => (
+              <div key={item.label} className={item.complete ? 'complete' : ''}>
+                <CheckCircle2 size={17} />
+                <span>{item.label}</span>
+              </div>
+            ))}
           </div>
         </section>
 
@@ -296,7 +331,6 @@ export function CustomerDashboardPage() {
               <span className="fc-portal-label">DADOS DE ACESSO</span>
               <h2>Informações da conta</h2>
             </div>
-
             <Building2 size={22} />
           </div>
 
@@ -305,12 +339,10 @@ export function CustomerDashboardPage() {
               <span>Responsável</span>
               <strong>{customer.fullName || 'Não informado'}</strong>
             </div>
-
             <div>
               <span>E-mail</span>
               <strong>{customer.email || 'Não informado'}</strong>
             </div>
-
             <div>
               <span>Identificação da empresa</span>
               <strong>{customer.companyId || 'Não disponível'}</strong>
@@ -318,11 +350,7 @@ export function CustomerDashboardPage() {
           </div>
         </section>
 
-        {error && (
-          <PortalMessage type="warning">
-            {error}
-          </PortalMessage>
-        )}
+        {error && <PortalMessage type="warning">{error}</PortalMessage>}
 
         <section className="fc-portal-card fc-portal-action-card">
           <div className="fc-portal-card-heading">
@@ -330,16 +358,19 @@ export function CustomerDashboardPage() {
               <span className="fc-portal-label">PRÓXIMA ETAPA</span>
               <h2>Pagamento e assinatura</h2>
             </div>
-
             <CreditCard size={23} />
           </div>
 
           <p>
-            Acompanhe a etapa de pagamento e envie seu comprovante
+            Acompanhe a etapa de pagamento e envie seus documentos
             diretamente pela plataforma.
           </p>
 
-          {['pending_review', 'awaiting_payment', 'payment_under_review'].includes(customer.registrationStatus) && (
+          {[
+            'pending_review',
+            'awaiting_payment',
+            'payment_under_review'
+          ].includes(customer.registrationStatus) && (
             <a href="/pagamento" className="fc-portal-action">
               Acessar pagamento <ArrowRight size={17} />
             </a>
@@ -347,7 +378,7 @@ export function CustomerDashboardPage() {
 
           {customer.registrationStatus === 'pending_review' && (
             <span className="fc-portal-muted">
-              Disponível após a aprovação do cadastro.
+              O pagamento será disponibilizado após a aprovação do cadastro.
             </span>
           )}
 
@@ -365,7 +396,7 @@ export function CustomerDashboardPage() {
 
           {customer.registrationStatus === 'rejected' && (
             <a
-              href="https://wa.me/5511976977449"
+              href={SUPPORT_URL}
               target="_blank"
               rel="noopener noreferrer"
               className="fc-portal-action"
@@ -381,7 +412,6 @@ export function CustomerDashboardPage() {
               <span className="fc-portal-label">SUPORTE</span>
               <h2>Precisa de ajuda?</h2>
             </div>
-
             <Headphones size={23} />
           </div>
 
@@ -391,7 +421,7 @@ export function CustomerDashboardPage() {
           </p>
 
           <a
-            href="https://wa.me/5511976977449"
+            href={SUPPORT_URL}
             target="_blank"
             rel="noopener noreferrer"
             className="fc-portal-text-link"
@@ -401,6 +431,7 @@ export function CustomerDashboardPage() {
         </section>
 
         <button
+          type="button"
           className="fc-portal-refresh"
           onClick={reload}
         >
@@ -413,55 +444,68 @@ export function CustomerDashboardPage() {
 }
 
 // =====================================================
-// PAGAMENTO
+// PAGAMENTO E CONTRATO
 // =====================================================
 
 export function CustomerPaymentPage() {
-  const {
-    customer,
-    loading,
-    error
-  } = useCustomerProfile()
+  const { customer, loading, error } = useCustomerProfile()
 
-  const [file, setFile] = useState(null)
+  const [receiptFile, setReceiptFile] = useState(null)
   const [paymentMethod, setPaymentMethod] = useState('pix')
-  const [sending, setSending] = useState(false)
-  const [message, setMessage] = useState('')
-  const [uploadError, setUploadError] = useState('')
+  const [sendingReceipt, setSendingReceipt] = useState(false)
+  const [receiptMessage, setReceiptMessage] = useState('')
+  const [receiptError, setReceiptError] = useState('')
+
   const [contract, setContract] = useState(null)
   const [contractFile, setContractFile] = useState(null)
-  const [contractLoading, setContractLoading] = useState(false)
+  const [contractLoading, setContractLoading] = useState(true)
   const [contractBusy, setContractBusy] = useState(false)
   const [contractMessage, setContractMessage] = useState('')
   const [contractError, setContractError] = useState('')
 
-  async function refreshContract() {
+  const refreshContract = useCallback(async () => {
     setContractLoading(true)
     setContractError('')
+
     try {
       const result = await getCurrentContract()
       setContract(result?.contract || null)
+      return result?.contract || null
     } catch (err) {
-      setContractError(err.message || 'Não foi possível consultar o contrato.')
+      setContractError(err?.message || 'Não foi possível consultar o contrato.')
+      return null
     } finally {
       setContractLoading(false)
     }
-  }
+  }, [])
 
   useEffect(() => {
     if (customer) refreshContract()
-  }, [customer])
+  }, [customer, refreshContract])
 
   async function handleGenerateContract() {
     setContractBusy(true)
     setContractError('')
     setContractMessage('')
+
     try {
       const result = await generateCustomerContract()
-      setContractMessage(result.message || 'Contrato gerado. Assine digitalmente e envie o PDF assinado.')
-      await refreshContract()
+      setContractMessage(
+        result?.message ||
+        'Contrato baixado. Assine digitalmente e envie o PDF assinado abaixo.'
+      )
+
+      // Atualiza o status após a criação do contrato.
+      const current = await refreshContract()
+
+      if (!current) {
+        setContractError(
+          'O PDF foi gerado, mas não conseguimos atualizar a situação do contrato. Atualize a página.'
+        )
+      }
     } catch (err) {
-      setContractError(err.message)
+      setContractError(err?.message || 'Não foi possível gerar o contrato.')
+      await refreshContract()
     } finally {
       setContractBusy(false)
     }
@@ -471,83 +515,83 @@ export function CustomerPaymentPage() {
     event.preventDefault()
     setContractError('')
     setContractMessage('')
-    if (!contractFile) {
-      setContractError('Selecione o contrato assinado em PDF.')
-      return
-    }
-    setContractBusy(true)
+
     try {
-      const result = await uploadSignedCustomerContract(contractFile)
-      setContractMessage(result.message || 'Contrato enviado para análise.')
-      setContractFile(null)
-      await refreshContract()
+      validatePdf(contractFile, 'o contrato assinado')
     } catch (err) {
       setContractError(err.message)
+      return
+    }
+
+    setContractBusy(true)
+
+    try {
+      const result = await uploadSignedCustomerContract(contractFile)
+      setContractMessage(
+        result?.message || 'Contrato enviado para análise administrativa.'
+      )
+      setContractFile(null)
+
+      // O backend deve alterar o status para awaiting_approval.
+      await refreshContract()
+    } catch (err) {
+      setContractError(err?.message || 'Não foi possível enviar o contrato.')
     } finally {
       setContractBusy(false)
     }
   }
 
-  if (loading) return <LoadingScreen />
+  async function handleReceiptSubmit(event) {
+    event.preventDefault()
+    setReceiptMessage('')
+    setReceiptError('')
 
-  if (!customer) {
-    return (
-      <main className="fc-portal-empty">
-        <h2>Sessão não encontrada</h2>
-        <p>{error}</p>
-        <a href="/login" className="fc-auth-submit">
-          Entrar novamente
-        </a>
-      </main>
-    )
+    try {
+      validatePaymentReceipt(receiptFile)
+    } catch (err) {
+      setReceiptError(err.message)
+      return
+    }
+
+    setSendingReceipt(true)
+
+    try {
+      const result = await uploadPaymentReceipt(receiptFile, paymentMethod)
+      setReceiptMessage(
+        result?.message || 'Comprovante enviado. Aguarde a análise administrativa.'
+      )
+      setReceiptFile(null)
+    } catch (err) {
+      setReceiptError(err?.message || 'Não foi possível enviar o comprovante.')
+    } finally {
+      setSendingReceipt(false)
+    }
   }
+
+  if (loading) return <LoadingScreen />
+  if (!customer) return <SessionError error={error} />
 
   const status = customer.registrationStatus
   const paymentLink = customer.paymentLink
+  const contractStatus = contract?.status
+  const canManageContract = status === 'awaiting_contract'
+  const contractApproved = contractStatus === 'approved'
 
-  async function handleSubmit(event) {
-    event.preventDefault()
-    setMessage('')
-    setUploadError('')
+  // O cliente só pode gerar/enviar contrato durante a etapa contratual.
+  const canGenerateContract =
+    canManageContract &&
+    (!contract || ['rejected', 'awaiting_signature'].includes(contractStatus))
 
-    if (!file) {
-      setUploadError('Selecione o comprovante antes de continuar.')
-      return
-    }
+  const canUploadContract =
+    canManageContract && contractStatus === 'awaiting_signature'
 
-    if (file.size > 10 * 1024 * 1024) {
-      setUploadError('O arquivo ultrapassa o limite de 10 MB.')
-      return
-    }
+  // Pagamento e comprovante só aparecem após a aprovação do contrato.
+  const canAccessPayment =
+    contractApproved &&
+    ['awaiting_payment', 'payment_under_review', 'active'].includes(status)
 
-    const allowedTypes = [
-      'application/pdf',
-      'image/jpeg',
-      'image/png'
-    ]
-
-    if (!allowedTypes.includes(file.type)) {
-      setUploadError('Envie um arquivo PDF, JPG ou PNG.')
-      return
-    }
-
-    setSending(true)
-
-    try {
-      const result = await uploadPaymentReceipt(file, paymentMethod)
-
-      setMessage(
-        result.message ||
-        'Comprovante enviado com sucesso. Aguarde a análise.'
-      )
-
-      setFile(null)
-    } catch (err) {
-      setUploadError(err.message)
-    } finally {
-      setSending(false)
-    }
-  }
+  const canSubmitReceipt =
+    contractApproved && ['awaiting_payment', 'active'].includes(status)
 
   return (
     <PortalLayout customer={customer} title="Pagamento">
@@ -558,47 +602,123 @@ export function CustomerPaymentPage() {
               <span className="fc-portal-label">ASSINATURA FOODCORE</span>
               <h2>Pagamento da assinatura</h2>
             </div>
-
             <CreditCard size={23} />
           </div>
 
-          <div className="fc-form-divider"><span>Contrato de prestação de serviços</span></div>
-          <p>Gere o contrato da sua empresa, assine digitalmente e envie o PDF assinado para análise.</p>
+          <div className="fc-form-divider">
+            <span>Contrato de prestação de serviços</span>
+          </div>
 
-          {contractLoading && <PortalMessage type="warning">Consultando situação do contrato...</PortalMessage>}
-          {contract && (
-            <PortalMessage type={contract.status === 'approved' ? 'success' : contract.status === 'rejected' ? 'error' : 'warning'}>
-              Contrato {contract.contract_number || ''}: {({ awaiting_signature: 'aguardando assinatura', awaiting_approval: 'em análise administrativa', approved: 'aprovado', rejected: 'rejeitado' }[contract.status] || contract.status)}
+          <p>
+            Gere o contrato da sua empresa, assine digitalmente e envie
+            o mesmo arquivo em PDF para análise.
+          </p>
+
+          {contractLoading && (
+            <PortalMessage type="warning">
+              Consultando situação do contrato...
             </PortalMessage>
           )}
-          {contractError && <PortalMessage type="error">{contractError}</PortalMessage>}
-          {contractMessage && <PortalMessage type="success">{contractMessage}</PortalMessage>}
 
-          {(!contract || ['rejected', 'awaiting_signature'].includes(contract.status)) && (
-            <button type="button" className="fc-auth-submit" onClick={handleGenerateContract} disabled={contractBusy || contractLoading}>
-              {contractBusy ? 'Preparando contrato...' : contract?.status === 'rejected' ? 'Gerar novo contrato' : 'Gerar e baixar contrato'}
+          {!contractLoading && contract && (
+            <PortalMessage
+              type={
+                contractStatus === 'approved'
+                  ? 'success'
+                  : contractStatus === 'rejected'
+                    ? 'error'
+                    : 'warning'
+              }
+            >
+              Contrato {contract.contract_number || ''}:{' '}
+              {CONTRACT_STATUS_LABELS[contractStatus] || contractStatus}
+            </PortalMessage>
+          )}
+
+          {!contractLoading && !contract && !contractError && (
+            <PortalMessage type="warning">
+              Nenhum contrato foi gerado. Gere o contrato para iniciar a assinatura.
+            </PortalMessage>
+          )}
+
+          {contractError && (
+            <PortalMessage type="error">{contractError}</PortalMessage>
+          )}
+
+          {contractMessage && (
+            <PortalMessage type="success">{contractMessage}</PortalMessage>
+          )}
+
+          {canGenerateContract && (
+            <button
+              type="button"
+              className="fc-auth-submit"
+              onClick={handleGenerateContract}
+              disabled={contractBusy || contractLoading}
+            >
+              {contractBusy
+                ? 'Preparando contrato...'
+                : contractStatus === 'rejected'
+                  ? 'Gerar novo contrato'
+                  : 'Gerar e baixar contrato'}
               {!contractBusy && <FileText size={17} />}
             </button>
           )}
 
-          {contract?.status === 'awaiting_signature' && (
+          {canUploadContract && (
             <form className="fc-payment-form" onSubmit={handleContractUpload}>
+              <div className="fc-form-divider">
+                <span>Enviar contrato assinado</span>
+              </div>
+
               <label className="fc-upload-area">
                 <UploadCloud size={28} />
-                <strong>{contractFile ? contractFile.name : 'Selecionar contrato assinado'}</strong>
+                <strong>
+                  {contractFile?.name || 'Selecionar contrato assinado'}
+                </strong>
                 <span>Somente PDF — máximo de 10 MB</span>
-                <input type="file" accept=".pdf,application/pdf" onChange={event => setContractFile(event.target.files?.[0] || null)} />
+                <input
+                  type="file"
+                  accept=".pdf,application/pdf"
+                  onChange={event => {
+                    setContractFile(event.target.files?.[0] || null)
+                    setContractError('')
+                  }}
+                />
               </label>
-              <button type="submit" className="fc-auth-submit" disabled={contractBusy || !contractFile}>
+
+              <button
+                type="submit"
+                className="fc-auth-submit"
+                disabled={contractBusy || !contractFile}
+              >
                 {contractBusy ? 'Enviando contrato...' : 'Enviar contrato assinado'}
                 {!contractBusy && <ArrowRight size={17} />}
               </button>
             </form>
           )}
 
+          {contractStatus === 'awaiting_approval' && (
+            <PortalMessage type="success">
+              Recebemos seu contrato. Ele está aguardando análise administrativa.
+            </PortalMessage>
+          )}
+
+          {contractStatus === 'approved' && (
+            <PortalMessage type="success">
+              Seu contrato foi aprovado.
+            </PortalMessage>
+          )}
+
           {status === 'pending_review' && (
             <PortalMessage type="warning">
               O pagamento será liberado após a aprovação do cadastro da sua empresa.
+            </PortalMessage>
+          )}
+
+          {!contractApproved && !['awaiting_contract', 'pending_review', 'rejected'].includes(status) && (
+            <PortalMessage type="warning">
+              A etapa de pagamento ficará disponível somente depois que o contrato for enviado e aprovado pela equipe FOODCORE.
             </PortalMessage>
           )}
 
@@ -616,38 +736,33 @@ export function CustomerPaymentPage() {
 
           {status === 'active' && (
             <PortalMessage type="success">
-              Sua empresa está ativa. Caso precise enviar um comprovante de renovação, utilize o formulário abaixo.
+              Sua empresa está ativa. Caso precise enviar um comprovante de renovação,
+              utilize o formulário abaixo.
             </PortalMessage>
           )}
 
-          {paymentLink && (
+          {canAccessPayment && paymentLink && (
             <div className="fc-payment-link-box">
               <span>LINK DE PAGAMENTO DISPONIBILIZADO PELA FOODCORE</span>
-
               <a
                 href={paymentLink}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="fc-auth-submit"
               >
-                Abrir pagamento externo
-                <ArrowUpRight size={17} />
+                Abrir pagamento externo <ArrowUpRight size={17} />
               </a>
             </div>
           )}
 
-          {['awaiting_payment', 'active'].includes(status) && (
-            <form
-              className="fc-payment-form"
-              onSubmit={handleSubmit}
-            >
+          {canSubmitReceipt && (
+            <form className="fc-payment-form" onSubmit={handleReceiptSubmit}>
               <div className="fc-form-divider">
                 <span>Enviar comprovante</span>
               </div>
 
               <label className="fc-field">
                 <span>Forma de pagamento</span>
-
                 <select
                   value={paymentMethod}
                   onChange={event => setPaymentMethod(event.target.value)}
@@ -660,39 +775,35 @@ export function CustomerPaymentPage() {
 
               <label className="fc-upload-area">
                 <UploadCloud size={28} />
-
                 <strong>
-                  {file ? file.name : 'Selecione seu comprovante'}
+                  {receiptFile?.name || 'Selecione seu comprovante'}
                 </strong>
-
                 <span>PDF, JPG ou PNG — máximo de 10 MB</span>
-
                 <input
                   type="file"
                   accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png"
-                  onChange={event => setFile(event.target.files?.[0] || null)}
+                  onChange={event => {
+                    setReceiptFile(event.target.files?.[0] || null)
+                    setReceiptError('')
+                  }}
                 />
               </label>
 
-              {uploadError && (
-                <PortalMessage type="error">
-                  {uploadError}
-                </PortalMessage>
+              {receiptError && (
+                <PortalMessage type="error">{receiptError}</PortalMessage>
               )}
 
-              {message && (
-                <PortalMessage type="success">
-                  {message}
-                </PortalMessage>
+              {receiptMessage && (
+                <PortalMessage type="success">{receiptMessage}</PortalMessage>
               )}
 
               <button
                 type="submit"
                 className="fc-auth-submit"
-                disabled={sending}
+                disabled={sendingReceipt || !receiptFile}
               >
-                {sending ? 'Enviando comprovante...' : 'Enviar comprovante'}
-                {!sending && <ArrowRight size={17} />}
+                {sendingReceipt ? 'Enviando comprovante...' : 'Enviar comprovante'}
+                {!sendingReceipt && <ArrowRight size={17} />}
               </button>
             </form>
           )}
@@ -708,55 +819,52 @@ export function CustomerPaymentPage() {
 }
 
 // =====================================================
-// DOWNLOAD
+// DOWNLOAD DO INSTALADOR
 // =====================================================
 
 export function CustomerDownloadPage() {
-  const {
-    customer,
-    loading,
-    error
-  } = useCustomerProfile()
+  const { customer, loading, error } = useCustomerProfile()
 
   const [release, setRelease] = useState(null)
   const [releaseError, setReleaseError] = useState('')
   const [downloading, setDownloading] = useState(false)
 
-  useEffect(() => {
-    if (!customer) return
+  const authorized =
+    customer?.companyStatus === 'active' &&
+    customer?.registrationStatus === 'active'
 
-    if (
-      customer.companyStatus !== 'active' ||
-      customer.registrationStatus !== 'active'
-    ) {
-      return
+  useEffect(() => {
+    let cancelled = false
+
+    if (!authorized) {
+      setRelease(null)
+      return undefined
     }
 
     getLatestRelease()
-      .then(setRelease)
-      .catch(err => setReleaseError(err.message))
-  }, [customer])
+      .then(result => {
+        if (!cancelled) {
+          // A API pode retornar o objeto diretamente ou encapsulado.
+          setRelease(result?.release || result)
+          setReleaseError('')
+        }
+      })
+      .catch(err => {
+        if (!cancelled) {
+          setReleaseError(err?.message || 'Não foi possível consultar a versão.')
+        }
+      })
 
-  if (loading) return <LoadingScreen />
-
-  if (!customer) {
-    return (
-      <main className="fc-portal-empty">
-        <h2>Sessão não encontrada</h2>
-        <p>{error}</p>
-        <a href="/login" className="fc-auth-submit">
-          Entrar novamente
-        </a>
-      </main>
-    )
-  }
-
-  const authorized =
-    customer.companyStatus === 'active' &&
-    customer.registrationStatus === 'active'
+    return () => {
+      cancelled = true
+    }
+  }, [authorized])
 
   async function handleDownload() {
-    if (!release?.downloadUrl) return
+    if (!release?.downloadUrl) {
+      setReleaseError('O endereço do instalador não está disponível.')
+      return
+    }
 
     setDownloading(true)
     setReleaseError('')
@@ -764,11 +872,14 @@ export function CustomerDownloadPage() {
     try {
       await downloadRelease(release.downloadUrl)
     } catch (err) {
-      setReleaseError(err.message)
+      setReleaseError(err?.message || 'Não foi possível baixar o instalador.')
     } finally {
       setDownloading(false)
     }
   }
+
+  if (loading) return <LoadingScreen />
+  if (!customer) return <SessionError error={error} />
 
   return (
     <PortalLayout customer={customer} title="Downloads">
@@ -779,14 +890,13 @@ export function CustomerDownloadPage() {
               <span className="fc-portal-label">FOODCORE ERP</span>
               <h2>Instalador do sistema</h2>
             </div>
-
             <ArrowDownToLine size={23} />
           </div>
 
           {!authorized && (
             <PortalMessage type="warning">
-              O instalador está disponível somente após a aprovação
-              e ativação da sua empresa.
+              O instalador estará disponível após a aprovação do cadastro
+              e a confirmação do pagamento.
             </PortalMessage>
           )}
 
@@ -796,15 +906,11 @@ export function CustomerDownloadPage() {
                 <div className="fc-release-icon">
                   <FileText size={27} />
                 </div>
-
                 <div>
                   <strong>FOODCORE ERP</strong>
-                  <span>Versão {release.version}</span>
+                  <span>Versão {release.version || 'mais recente'}</span>
                 </div>
-
-                <span className="fc-release-badge">
-                  Disponível
-                </span>
+                <span className="fc-release-badge">Disponível</span>
               </div>
 
               {release.notes && (
@@ -815,6 +921,7 @@ export function CustomerDownloadPage() {
               )}
 
               <button
+                type="button"
                 className="fc-auth-submit"
                 onClick={handleDownload}
                 disabled={downloading}
@@ -828,12 +935,6 @@ export function CustomerDownloadPage() {
           {authorized && !release && (
             <PortalMessage type="warning">
               {releaseError || 'Não há uma versão publicada no momento.'}
-            </PortalMessage>
-          )}
-
-          {releaseError && release && (
-            <PortalMessage type="error">
-              {releaseError}
             </PortalMessage>
           )}
 

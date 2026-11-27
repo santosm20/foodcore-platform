@@ -55,7 +55,8 @@ const SUBSCRIPTION_SELECT = `
   billing_day,
   next_due_date,
   grace_days,
-  status
+  status,
+  created_at
 `
 
 const LICENSE_SELECT = `
@@ -84,6 +85,34 @@ const COMPANY_SELECT = `
   payment_link,
   created_at
 `
+
+// =====================================================
+// STATUS COMERCIAIS
+// =====================================================
+
+const REGISTRATION = Object.freeze({
+  PENDING_REVIEW: 'pending_review',
+  AWAITING_CONTRACT: 'awaiting_contract',
+  CONTRACT_APPROVED: 'contract_approved',
+  AWAITING_PAYMENT: 'awaiting_payment',
+  PAYMENT_UNDER_REVIEW: 'payment_under_review',
+  ACTIVE: 'active',
+  REJECTED: 'rejected',
+  SUSPENDED: 'suspended'
+})
+
+const CONTRACT_STATUS = Object.freeze({
+  AWAITING_APPROVAL: 'awaiting_approval',
+  APPROVED: 'approved',
+  REJECTED: 'rejected'
+})
+
+const PAYMENT_STATUS = Object.freeze({
+  PENDING: 'pending',
+  UNDER_REVIEW: 'under_review',
+  CONFIRMED: 'confirmed',
+  REJECTED: 'rejected'
+})
 
 // =====================================================
 // UPLOAD DE VERSÕES
@@ -129,7 +158,7 @@ const upload = multer({
 })
 
 // =====================================================
-// RESPOSTAS E UTILITÁRIOS
+// UTILITÁRIOS GERAIS
 // =====================================================
 
 function databaseUnavailable(res) {
@@ -210,24 +239,6 @@ function validatePaymentLink(value) {
   }
 }
 
-// =====================================================
-// DATAS E COBRANÇAS
-// =====================================================
-
-function formatDateUTC(date) {
-  const year = date.getUTCFullYear()
-
-  const month = String(
-    date.getUTCMonth() + 1
-  ).padStart(2, '0')
-
-  const day = String(
-    date.getUTCDate()
-  ).padStart(2, '0')
-
-  return `${year}-${month}-${day}`
-}
-
 function parseDateUTC(value) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) {
     throw new Error('Data inválida.')
@@ -237,13 +248,49 @@ function parseDateUTC(value) {
 
   if (
     Number.isNaN(date.getTime()) ||
-    formatDateUTC(date) !== value
+    date.toISOString().slice(0, 10) !== value
   ) {
     throw new Error('Data inválida.')
   }
 
   return date
 }
+
+function formatDateUTC(date) {
+  return date.toISOString().slice(0, 10)
+}
+
+function getDecision(req) {
+  return String(
+    req.body?.decision || ''
+  ).trim().toLowerCase()
+}
+
+function getReason(req) {
+  return String(
+    req.body?.reason || ''
+  ).trim()
+}
+
+function validateDecisionInput(decision, reason) {
+  if (!['approve', 'reject'].includes(decision)) {
+    return 'Decisão inválida. Utilize approve ou reject.'
+  }
+
+  if (decision === 'reject' && reason.length < 5) {
+    return 'Informe uma justificativa com pelo menos 5 caracteres.'
+  }
+
+  if (reason.length > 2000) {
+    return 'A justificativa ultrapassa 2.000 caracteres.'
+  }
+
+  return null
+}
+
+// =====================================================
+// DATAS E COBRANÇAS
+// =====================================================
 
 function getBillingDateForMonth(
   year,
@@ -373,14 +420,7 @@ async function registerAdminLog({
   details = {},
   adminEmail
 }) {
-  if (!supabase) {
-    logServerError(
-      'Auditoria não registrada',
-      'Supabase indisponível.'
-    )
-
-    return false
-  }
+  if (!supabase) return false
 
   try {
     const { error } = await supabase
@@ -480,6 +520,104 @@ async function validateExecutableFile(filePath) {
 }
 
 // =====================================================
+// CONSULTAS DE CONTRATO E ASSINATURA
+// =====================================================
+
+async function getApprovedContract(companyId) {
+  const { data, error } = await supabase
+    .from('contracts')
+    .select(`
+      id,
+      company_id,
+      contract_number,
+      monthly_price,
+      status,
+      created_at,
+      approved_at
+    `)
+    .eq('company_id', companyId)
+    .eq('status', CONTRACT_STATUS.APPROVED)
+    .order('approved_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  if (error) throw error
+
+  return data
+}
+
+async function getSubscriptionForContract(contract) {
+  const { data, error } = await supabase
+    .from('subscriptions')
+    .select(SUBSCRIPTION_SELECT)
+    .eq('contract_id', contract.id)
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle()
+
+  if (error) throw error
+
+  return data
+}
+
+async function createSubscriptionForContract(contract) {
+  if (!contract?.id || !contract?.company_id) {
+    throw new Error('Contrato inválido para criação da assinatura.')
+  }
+
+  if (contract.status !== CONTRACT_STATUS.APPROVED) {
+    throw new Error(
+      'Não é permitido criar assinatura para contrato não aprovado.'
+    )
+  }
+
+  const existing = await getSubscriptionForContract(contract)
+
+  if (existing) return existing
+
+  const referenceDate = contract.created_at
+    ? new Date(contract.created_at)
+    : new Date()
+
+  if (Number.isNaN(referenceDate.getTime())) {
+    throw new Error('Data de criação do contrato inválida.')
+  }
+
+  const billingDay = getBillingDay(referenceDate)
+
+  const nextDueDate = getBillingDate(
+    referenceDate,
+    billingDay
+  )
+
+  const { data, error } = await supabase
+    .from('subscriptions')
+    .insert({
+      company_id: contract.company_id,
+      contract_id: contract.id,
+      monthly_price: getMonthlyPrice(
+        contract.monthly_price
+      ),
+      billing_day: billingDay,
+      next_due_date: nextDueDate,
+      grace_days: GRACE_DAYS,
+      status: 'pending'
+    })
+    .select(SUBSCRIPTION_SELECT)
+    .single()
+
+  if (!error) return data
+
+  // Recupera uma assinatura eventualmente criada
+  // por uma operação concorrente.
+  const retry = await getSubscriptionForContract(contract)
+
+  if (retry) return retry
+
+  throw error
+}
+
+// =====================================================
 // COBRANÇAS
 // =====================================================
 
@@ -510,109 +648,34 @@ async function ensurePaymentForSubscription(subscription) {
 
   parseDateUTC(subscription.next_due_date)
 
-  const existingPayment = await findPaymentForSubscription(
+  const existing = await findPaymentForSubscription(
     subscription
   )
 
-  if (existingPayment) {
-    return existingPayment
-  }
+  if (existing) return existing
 
-  const { data: payment, error: insertError } =
-    await supabase
-      .from('payments')
-      .insert({
-        subscription_id: subscription.id,
-        amount: getMonthlyPrice(
-          subscription.monthly_price
-        ),
-        due_date: subscription.next_due_date,
-        status: 'pending'
-      })
-      .select(PAYMENT_SELECT)
-      .single()
+  const { data, error } = await supabase
+    .from('payments')
+    .insert({
+      subscription_id: subscription.id,
+      amount: getMonthlyPrice(
+        subscription.monthly_price
+      ),
+      due_date: subscription.next_due_date,
+      status: PAYMENT_STATUS.PENDING
+    })
+    .select(PAYMENT_SELECT)
+    .single()
 
-  if (!insertError) {
-    return payment
-  }
+  if (!error) return data
 
-  const paymentAfterInsert = await findPaymentForSubscription(
+  const retry = await findPaymentForSubscription(
     subscription
   )
 
-  if (paymentAfterInsert) {
-    return paymentAfterInsert
-  }
+  if (retry) return retry
 
-  throw insertError
-}
-
-// =====================================================
-// ASSINATURAS SEM CONTRATO
-// =====================================================
-
-async function findOrCreateCustomerSubscription(companyId) {
-  const { data: existingSubscriptions, error } =
-    await supabase
-      .from('subscriptions')
-      .select(SUBSCRIPTION_SELECT)
-      .eq('company_id', companyId)
-      .is('contract_id', null)
-      .order('created_at', { ascending: false })
-      .limit(1)
-
-  if (error) throw error
-
-  let subscription = existingSubscriptions?.[0] || null
-
-  if (!subscription) {
-    const referenceDate = new Date()
-    const billingDay = getBillingDay(referenceDate)
-
-    const nextDueDate = getBillingDate(
-      referenceDate,
-      billingDay
-    )
-
-    const { data: createdSubscription, error: createError } =
-      await supabase
-        .from('subscriptions')
-        .insert({
-          company_id: companyId,
-          contract_id: null,
-          monthly_price: MONTHLY_PRICE,
-          billing_day: billingDay,
-          next_due_date: nextDueDate,
-          grace_days: GRACE_DAYS,
-          status: 'pending'
-        })
-        .select(SUBSCRIPTION_SELECT)
-        .single()
-
-    if (createError) {
-      // Recupera uma assinatura criada simultaneamente.
-      const { data: retrySubscriptions, error: retryError } =
-        await supabase
-          .from('subscriptions')
-          .select(SUBSCRIPTION_SELECT)
-          .eq('company_id', companyId)
-          .is('contract_id', null)
-          .order('created_at', { ascending: false })
-          .limit(1)
-
-      if (retryError) throw retryError
-
-      if (!retrySubscriptions?.length) {
-        throw createError
-      }
-
-      subscription = retrySubscriptions[0]
-    } else {
-      subscription = createdSubscription
-    }
-  }
-
-  return subscription
+  throw error
 }
 
 // =====================================================
@@ -650,7 +713,7 @@ async function enrichPayments(payments) {
   const companyIds = [
     ...new Set(
       (subscriptions || [])
-        .map(subscription => subscription.company_id)
+        .map(item => item.company_id)
         .filter(Boolean)
     )
   ]
@@ -658,7 +721,7 @@ async function enrichPayments(payments) {
   const contractIds = [
     ...new Set(
       (subscriptions || [])
-        .map(subscription => subscription.contract_id)
+        .map(item => item.contract_id)
         .filter(Boolean)
     )
   ]
@@ -703,13 +766,8 @@ async function enrichPayments(payments) {
         })
   ])
 
-  if (companiesResult.error) {
-    throw companiesResult.error
-  }
-
-  if (contractsResult.error) {
-    throw contractsResult.error
-  }
+  if (companiesResult.error) throw companiesResult.error
+  if (contractsResult.error) throw contractsResult.error
 
   const subscriptionMap = new Map(
     (subscriptions || []).map(item => [
@@ -821,10 +879,7 @@ router.post('/login', async (req, res) => {
       expiresIn: 28800
     })
   } catch (error) {
-    logServerError(
-      'Erro no login administrativo',
-      error
-    )
+    logServerError('Erro no login administrativo', error)
 
     return res.status(500).json({
       error: 'Não foi possível realizar o login.'
@@ -833,19 +888,20 @@ router.post('/login', async (req, res) => {
 })
 
 // =====================================================
-// CADASTROS - LISTAGEM DE EMPRESAS PENDENTES
+// CADASTROS - LISTAGEM
 // =====================================================
 
 router.get('/customers/pending', requireAdmin, async (_req, res) => {
   try {
-    if (!supabase) {
-      return databaseUnavailable(res)
-    }
+    if (!supabase) return databaseUnavailable(res)
 
     const { data, error } = await supabase
       .from('companies')
       .select(COMPANY_SELECT)
-      .eq('registration_status', 'pending_review')
+      .in('registration_status', [
+        REGISTRATION.PENDING_REVIEW,
+        REGISTRATION.AWAITING_CONTRACT
+      ])
       .order('created_at', { ascending: true })
 
     if (error) throw error
@@ -855,10 +911,7 @@ router.get('/customers/pending', requireAdmin, async (_req, res) => {
       customers: data || []
     })
   } catch (error) {
-    logServerError(
-      'Erro ao listar cadastros pendentes',
-      error
-    )
+    logServerError('Erro ao listar cadastros pendentes', error)
 
     return res.status(500).json({
       error: 'Não foi possível carregar os cadastros pendentes.'
@@ -867,14 +920,96 @@ router.get('/customers/pending', requireAdmin, async (_req, res) => {
 })
 
 // =====================================================
-// CADASTROS - DETALHES DA EMPRESA
+// CADASTROS - DECISÃO ADMINISTRATIVA
+// =====================================================
+
+router.patch(
+  '/customers/:id/decision',
+  requireAdmin,
+  async (req, res) => {
+    try {
+      if (!supabase) return databaseUnavailable(res)
+
+      const companyId = req.params.id
+      const decision = getDecision(req)
+      const reason = getReason(req)
+
+      if (!validUuid(companyId)) {
+        return res.status(400).json({
+          error: 'Identificador de empresa inválido.'
+        })
+      }
+
+      const validationError = validateDecisionInput(
+        decision,
+        reason
+      )
+
+      if (validationError) {
+        return res.status(400).json({
+          error: validationError
+        })
+      }
+
+      const {
+        data: updatedCompany,
+        error
+      } = await supabase
+        .from('companies')
+        .update({
+          registration_status: decision === 'approve'
+            ? REGISTRATION.AWAITING_CONTRACT
+            : REGISTRATION.REJECTED
+        })
+        .eq('id', companyId)
+        .eq('registration_status', REGISTRATION.PENDING_REVIEW)
+        .select(COMPANY_SELECT)
+        .maybeSingle()
+
+      if (error) throw error
+
+      if (!updatedCompany) {
+        return res.status(409).json({
+          error: 'Este cadastro já foi analisado ou não está mais pendente.'
+        })
+      }
+
+      await registerAdminLog({
+        companyId,
+        action: decision === 'approve'
+          ? 'customer_registration_approved'
+          : 'customer_registration_rejected',
+        adminEmail: getAdminEmail(req),
+        details: {
+          decision,
+          reason: decision === 'reject' ? reason : null
+        }
+      })
+
+      return res.json({
+        success: true,
+        message: decision === 'approve'
+          ? 'Cadastro aprovado. O cliente já pode gerar o contrato.'
+          : 'Cadastro rejeitado.',
+        company: updatedCompany
+      })
+    } catch (error) {
+      logServerError('Erro na decisão do cadastro', error)
+
+      return res.status(500).json({
+        error: 'Não foi possível concluir a análise do cadastro.'
+      })
+    }
+  }
+)
+
+// =====================================================
+// CADASTROS - DETALHES
 // =====================================================
 
 router.get('/customers/:id', requireAdmin, async (req, res) => {
   try {
-    if (!supabase) {
-      return databaseUnavailable(res)
-    }
+    if (!supabase) return databaseUnavailable(res)
 
     const companyId = req.params.id
 
@@ -915,10 +1050,7 @@ router.get('/customers/:id', requireAdmin, async (req, res) => {
       subscriptions: subscriptions || []
     })
   } catch (error) {
-    logServerError(
-      'Erro ao consultar empresa',
-      error
-    )
+    logServerError('Erro ao consultar empresa', error)
 
     return res.status(500).json({
       error: 'Não foi possível consultar a empresa.'
@@ -927,7 +1059,7 @@ router.get('/customers/:id', requireAdmin, async (req, res) => {
 })
 
 // =====================================================
-// CADASTROS - VINCULAR LINK DE PAGAMENTO
+// CADASTROS - LINK DE PAGAMENTO
 // =====================================================
 
 router.patch(
@@ -935,9 +1067,7 @@ router.patch(
   requireAdmin,
   async (req, res) => {
     try {
-      if (!supabase) {
-        return databaseUnavailable(res)
-      }
+      if (!supabase) return databaseUnavailable(res)
 
       const companyId = req.params.id
 
@@ -953,24 +1083,23 @@ router.patch(
 
       if (!paymentLink) {
         return res.status(400).json({
-          error: 'Informe um link HTTP ou HTTPS válido, com até 2.048 caracteres.'
+          error: 'Informe um link HTTP ou HTTPS válido.'
         })
       }
 
-      const {
-        data: company,
-        error: companyFindError
-      } = await supabase
-        .from('companies')
-        .select(`
-          id,
-          legal_name,
-          registration_status
-        `)
-        .eq('id', companyId)
-        .maybeSingle()
+      const { data: company, error: companyError } =
+        await supabase
+          .from('companies')
+          .select(`
+            id,
+            legal_name,
+            status,
+            registration_status
+          `)
+          .eq('id', companyId)
+          .maybeSingle()
 
-      if (companyFindError) throw companyFindError
+      if (companyError) throw companyError
 
       if (!company) {
         return res.status(404).json({
@@ -979,27 +1108,34 @@ router.patch(
       }
 
       if (
-        !['pending_review', 'awaiting_payment'].includes(
-          company.registration_status
-        )
+        company.registration_status !== REGISTRATION.CONTRACT_APPROVED &&
+        company.registration_status !== REGISTRATION.AWAITING_PAYMENT
       ) {
         return res.status(409).json({
-          error: 'Este cadastro não permite alteração do link de pagamento.'
+          error: 'O link de pagamento só pode ser liberado após a aprovação do contrato.'
         })
       }
 
-      // Cria ou reutiliza a assinatura sem contrato.
-      const subscription = await findOrCreateCustomerSubscription(
-        companyId
+      const approvedContract = await getApprovedContract(companyId)
+
+      if (!approvedContract) {
+        return res.status(409).json({
+          error: 'Não existe contrato aprovado para esta empresa.'
+        })
+      }
+
+      // A assinatura é criada ou recuperada somente
+      // depois de existir contrato aprovado.
+      const subscription = await createSubscriptionForContract(
+        approvedContract
       )
 
-      // Garante a existência da primeira cobrança.
+      // A primeira cobrança nasce somente nesta etapa,
+      // quando o administrador libera o link de pagamento.
       const payment = await ensurePaymentForSubscription(
         subscription
       )
 
-      // Atualiza somente enquanto o cadastro ainda
-      // estiver em uma etapa que permite receber o link.
       const {
         data: updatedCompany,
         error: updateError
@@ -1007,17 +1143,18 @@ router.patch(
         .from('companies')
         .update({
           payment_link: paymentLink,
-          registration_status: 'awaiting_payment'
+          registration_status: REGISTRATION.AWAITING_PAYMENT
         })
         .eq('id', companyId)
         .in('registration_status', [
-          'pending_review',
-          'awaiting_payment'
+          REGISTRATION.CONTRACT_APPROVED,
+          REGISTRATION.AWAITING_PAYMENT
         ])
         .select(`
           id,
           legal_name,
-          registration_status
+          registration_status,
+          payment_link
         `)
         .maybeSingle()
 
@@ -1034,26 +1171,23 @@ router.patch(
         action: 'customer_payment_link_created',
         adminEmail: getAdminEmail(req),
         details: {
+          contract_id: approvedContract.id,
           subscription_id: subscription.id,
           payment_id: payment.id,
           amount: payment.amount,
-          due_date: payment.due_date,
-          payment_link_updated: true
+          due_date: payment.due_date
         }
       })
 
       return res.json({
         success: true,
-        message: 'Link de pagamento vinculado. Empresa aguardando pagamento.',
+        message: 'Link de pagamento liberado para o cliente.',
         company: updatedCompany,
         subscription,
         payment
       })
     } catch (error) {
-      logServerError(
-        'Erro ao vincular link de pagamento',
-        error
-      )
+      logServerError('Erro ao vincular link de pagamento', error)
 
       return res.status(500).json({
         error: 'Não foi possível vincular o link de pagamento.'
@@ -1068,9 +1202,7 @@ router.patch(
 
 router.get('/contracts', requireAdmin, async (_req, res) => {
   try {
-    if (!supabase) {
-      return databaseUnavailable(res)
-    }
+    if (!supabase) return databaseUnavailable(res)
 
     const { data: contracts, error } = await supabase
       .from('contracts')
@@ -1084,7 +1216,7 @@ router.get('/contracts', requireAdmin, async (_req, res) => {
         created_at,
         approved_at
       `)
-      .eq('status', 'awaiting_approval')
+      .eq('status', CONTRACT_STATUS.AWAITING_APPROVAL)
       .order('signed_at', { ascending: false })
 
     if (error) throw error
@@ -1130,21 +1262,15 @@ router.get('/contracts', requireAdmin, async (_req, res) => {
       ])
     )
 
-    const result = contracts.map(contract => ({
-      ...contract,
-      company:
-        companyMap.get(contract.company_id) || null
-    }))
-
     return res.json({
       success: true,
-      contracts: result
+      contracts: contracts.map(contract => ({
+        ...contract,
+        company: companyMap.get(contract.company_id) || null
+      }))
     })
   } catch (error) {
-    logServerError(
-      'Erro ao listar contratos',
-      error
-    )
+    logServerError('Erro ao listar contratos', error)
 
     return res.status(500).json({
       error: 'Não foi possível carregar os contratos.'
@@ -1153,7 +1279,7 @@ router.get('/contracts', requireAdmin, async (_req, res) => {
 })
 
 // =====================================================
-// CONTRATOS - DOWNLOAD DO DOCUMENTO ASSINADO
+// CONTRATOS - DOWNLOAD ASSINADO
 // =====================================================
 
 router.get(
@@ -1161,9 +1287,7 @@ router.get(
   requireAdmin,
   async (req, res) => {
     try {
-      if (!supabase) {
-        return databaseUnavailable(res)
-      }
+      if (!supabase) return databaseUnavailable(res)
 
       const contractId = req.params.id
 
@@ -1196,46 +1320,25 @@ router.get(
       )
 
       if (!Buffer.isBuffer(file)) {
-        throw new Error(
-          'Arquivo do contrato inválido.'
-        )
+        throw new Error('Arquivo do contrato inválido.')
       }
 
       const filename = getSafeFilename(
         `contrato-assinado-${contract.contract_number}.pdf`
       )
 
-      res.setHeader(
-        'Content-Type',
-        'application/pdf'
-      )
-
+      res.setHeader('Content-Type', 'application/pdf')
       res.setHeader(
         'Content-Disposition',
         `attachment; filename="${filename}"`
       )
-
-      res.setHeader(
-        'Content-Length',
-        file.length
-      )
-
-      res.setHeader(
-        'Cache-Control',
-        'private, no-store'
-      )
-
-      res.setHeader(
-        'X-Content-Type-Options',
-        'nosniff'
-      )
+      res.setHeader('Content-Length', file.length)
+      res.setHeader('Cache-Control', 'private, no-store')
+      res.setHeader('X-Content-Type-Options', 'nosniff')
 
       return res.send(file)
     } catch (error) {
-      logServerError(
-        'Erro ao baixar contrato administrativo',
-        error
-      )
+      logServerError('Erro ao baixar contrato', error)
 
       return res.status(500).json({
         error: 'Não foi possível baixar o contrato.'
@@ -1253,19 +1356,11 @@ router.patch(
   requireAdmin,
   async (req, res) => {
     try {
-      if (!supabase) {
-        return databaseUnavailable(res)
-      }
+      if (!supabase) return databaseUnavailable(res)
 
       const contractId = req.params.id
-
-      const decision = String(
-        req.body?.decision || ''
-      ).trim().toLowerCase()
-
-      const reason = String(
-        req.body?.reason || ''
-      ).trim()
+      const decision = getDecision(req)
+      const reason = getReason(req)
 
       if (!validUuid(contractId)) {
         return res.status(400).json({
@@ -1273,42 +1368,35 @@ router.patch(
         })
       }
 
-      if (!['approve', 'reject'].includes(decision)) {
+      const validationError = validateDecisionInput(
+        decision,
+        reason
+      )
+
+      if (validationError) {
         return res.status(400).json({
-          error: 'Decisão inválida. Utilize approve ou reject.'
+          error: validationError
         })
       }
 
-      if (
-        decision === 'reject' &&
-        reason.length < 5
-      ) {
-        return res.status(400).json({
-          error: 'Informe uma justificativa para rejeitar o contrato.'
-        })
-      }
+      // -------------------------------------------------
+      // 1. LOCALIZA O CONTRATO
+      // -------------------------------------------------
 
-      if (reason.length > 2000) {
-        return res.status(400).json({
-          error: 'A justificativa ultrapassa 2.000 caracteres.'
-        })
-      }
-
-      const {
-        data: currentContract,
-        error: findError
-      } = await supabase
-        .from('contracts')
-        .select(`
-          id,
-          company_id,
-          contract_number,
-          monthly_price,
-          status,
-          created_at
-        `)
-        .eq('id', contractId)
-        .maybeSingle()
+      const { data: currentContract, error: findError } =
+        await supabase
+          .from('contracts')
+          .select(`
+            id,
+            company_id,
+            contract_number,
+            monthly_price,
+            status,
+            created_at,
+            approved_at
+          `)
+          .eq('id', contractId)
+          .maybeSingle()
 
       if (findError) throw findError
 
@@ -1318,143 +1406,158 @@ router.patch(
         })
       }
 
-      if (
-        currentContract.status !== 'awaiting_approval' &&
-        !(
-          decision === 'approve' &&
-          currentContract.status === 'approved'
-        )
-      ) {
-        return res.status(409).json({
-          error: 'Este contrato não está aguardando análise.'
+      // -------------------------------------------------
+      // 2. LOCALIZA A EMPRESA
+      // -------------------------------------------------
+
+      const { data: company, error: companyFindError } =
+        await supabase
+          .from('companies')
+          .select(`
+            id,
+            registration_status
+          `)
+          .eq('id', currentContract.company_id)
+          .maybeSingle()
+
+      if (companyFindError) throw companyFindError
+
+      if (!company) {
+        return res.status(404).json({
+          error: 'Empresa vinculada ao contrato não encontrada.'
         })
       }
 
-      let subscription = null
-      let payment = null
-      let contract = currentContract
-
       // -------------------------------------------------
-      // PREPARAÇÃO DA ASSINATURA E PRIMEIRA COBRANÇA
+      // 3. REJEIÇÃO DO CONTRATO
       // -------------------------------------------------
 
-      if (decision === 'approve') {
+      if (decision === 'reject') {
+        if (
+          currentContract.status !== CONTRACT_STATUS.AWAITING_APPROVAL
+        ) {
+          return res.status(409).json({
+            error: 'Este contrato não está aguardando análise.'
+          })
+        }
+
+        if (
+          company.registration_status !== REGISTRATION.AWAITING_CONTRACT
+        ) {
+          return res.status(409).json({
+            error: 'A empresa não está na etapa de análise contratual.'
+          })
+        }
+
         const {
-          data: existingSubscriptions,
-          error: subscriptionFindError
+          data: rejectedContract,
+          error: rejectError
         } = await supabase
-          .from('subscriptions')
-          .select(SUBSCRIPTION_SELECT)
-          .eq('contract_id', contractId)
-          .order('created_at', { ascending: true })
-          .limit(1)
+          .from('contracts')
+          .update({
+            status: CONTRACT_STATUS.REJECTED
+          })
+          .eq('id', contractId)
+          .eq('status', CONTRACT_STATUS.AWAITING_APPROVAL)
+          .select(`
+            id,
+            company_id,
+            contract_number,
+            status
+          `)
+          .maybeSingle()
 
-        if (subscriptionFindError) {
-          throw subscriptionFindError
+        if (rejectError) throw rejectError
+
+        if (!rejectedContract) {
+          return res.status(409).json({
+            error: 'O contrato foi alterado por outra operação.'
+          })
         }
 
-        subscription = existingSubscriptions?.[0] || null
+        // O cliente poderá corrigir e enviar um novo contrato.
+        // Não rejeitamos o cadastro inteiro.
+        const {
+          data: updatedCompany,
+          error: companyUpdateError
+        } = await supabase
+          .from('companies')
+          .update({
+            registration_status: REGISTRATION.AWAITING_CONTRACT
+          })
+          .eq('id', company.id)
+          .eq('registration_status', REGISTRATION.AWAITING_CONTRACT)
+          .select('id, registration_status')
+          .maybeSingle()
 
-        if (!subscription) {
-          const referenceDate = currentContract.created_at
-            ? new Date(currentContract.created_at)
-            : new Date()
+        if (companyUpdateError) throw companyUpdateError
 
-          if (
-            Number.isNaN(referenceDate.getTime())
-          ) {
-            throw new Error(
-              'Data de criação do contrato inválida.'
-            )
-          }
-
-          const billingDay = getBillingDay(referenceDate)
-
-          const nextDueDate = getBillingDate(
-            referenceDate,
-            billingDay
+        if (!updatedCompany) {
+          throw new Error(
+            'Contrato rejeitado, mas não foi possível confirmar o estado do cadastro.'
           )
-
-          const {
-            data: newSubscription,
-            error: createError
-          } = await supabase
-            .from('subscriptions')
-            .insert({
-              company_id: currentContract.company_id,
-              contract_id: currentContract.id,
-              monthly_price: getMonthlyPrice(
-                currentContract.monthly_price
-              ),
-              billing_day: billingDay,
-              next_due_date: nextDueDate,
-              grace_days: GRACE_DAYS,
-              status: 'pending'
-            })
-            .select(SUBSCRIPTION_SELECT)
-            .single()
-
-          if (createError) {
-            const {
-              data: retrySubscriptions,
-              error: retryError
-            } = await supabase
-              .from('subscriptions')
-              .select(SUBSCRIPTION_SELECT)
-              .eq('contract_id', contractId)
-              .order('created_at', { ascending: true })
-              .limit(1)
-
-            if (retryError) throw retryError
-
-            if (!retrySubscriptions?.length) {
-              throw createError
-            }
-
-            subscription = retrySubscriptions[0]
-          } else {
-            subscription = newSubscription
-          }
         }
 
-        payment = await ensurePaymentForSubscription(
-          subscription
-        )
+        await registerAdminLog({
+          companyId: company.id,
+          action: 'contract_rejected',
+          adminEmail: getAdminEmail(req),
+          details: {
+            contract_id: contractId,
+            contract_number: currentContract.contract_number,
+            reason
+          }
+        })
+
+        return res.json({
+          success: true,
+          message: 'Contrato rejeitado. O cliente poderá corrigir e enviar novamente.',
+          contract: rejectedContract
+        })
       }
 
       // -------------------------------------------------
-      // ATUALIZA CONTRATO
+      // 4. APROVAÇÃO DO CONTRATO
       // -------------------------------------------------
 
+      let approvedContract = currentContract
+      let newlyApproved = false
+
       if (
-        currentContract.status === 'awaiting_approval'
+        currentContract.status === CONTRACT_STATUS.AWAITING_APPROVAL
       ) {
+        if (
+          company.registration_status !== REGISTRATION.AWAITING_CONTRACT
+        ) {
+          return res.status(409).json({
+            error: 'A empresa não está na etapa de análise contratual.'
+          })
+        }
+
         const timestamp = new Date().toISOString()
 
-        const updateData = {
-          status: decision === 'approve'
-            ? 'approved'
-            : 'rejected'
-        }
-
-        if (decision === 'approve') {
-          updateData.approved_by = null
-          updateData.approved_at = timestamp
-        }
-
+        // IMPORTANTE:
+        // Primeiro atualiza o contrato no banco.
+        // A assinatura só será criada depois da confirmação.
         const {
           data: updatedContract,
           error: updateError
         } = await supabase
           .from('contracts')
-          .update(updateData)
+          .update({
+            status: CONTRACT_STATUS.APPROVED,
+            approved_by: null,
+            approved_at: timestamp
+          })
           .eq('id', contractId)
-          .eq('status', 'awaiting_approval')
+          .eq('status', CONTRACT_STATUS.AWAITING_APPROVAL)
           .select(`
             id,
             company_id,
             contract_number,
+            monthly_price,
             status,
+            created_at,
             approved_at
           `)
           .maybeSingle()
@@ -1462,46 +1565,149 @@ router.patch(
         if (updateError) throw updateError
 
         if (!updatedContract) {
-          return res.status(409).json({
-            error: 'O contrato foi alterado por outra operação. Atualize a lista.'
-          })
-        }
+          // Outra operação pode ter aprovado o contrato.
+          // Faz uma nova consulta para recuperar o estado real.
+          const {
+            data: refreshedContract,
+            error: refreshError
+          } = await supabase
+            .from('contracts')
+            .select(`
+              id,
+              company_id,
+              contract_number,
+              monthly_price,
+              status,
+              created_at,
+              approved_at
+            `)
+            .eq('id', contractId)
+            .maybeSingle()
 
-        contract = updatedContract
+          if (refreshError) throw refreshError
+
+          if (
+            !refreshedContract ||
+            refreshedContract.status !== CONTRACT_STATUS.APPROVED
+          ) {
+            return res.status(409).json({
+              error: 'O contrato foi alterado por outra operação. Atualize a lista.'
+            })
+          }
+
+          approvedContract = refreshedContract
+        } else {
+          approvedContract = updatedContract
+          newlyApproved = true
+        }
+      } else if (
+        currentContract.status !== CONTRACT_STATUS.APPROVED
+      ) {
+        return res.status(409).json({
+          error: 'Este contrato não pode ser aprovado no estado atual.'
+        })
       }
 
+      // -------------------------------------------------
+      // 5. CRIA OU RECUPERA A ASSINATURA
+      // -------------------------------------------------
+
+      // Esta função também verifica se já existe assinatura.
+      // Não cria pagamento nesta etapa.
+      const subscription = await createSubscriptionForContract(
+        approvedContract
+      )
+
+      // -------------------------------------------------
+      // 6. ATUALIZA O ESTADO COMERCIAL DA EMPRESA
+      // -------------------------------------------------
+
+      if (
+        company.registration_status === REGISTRATION.AWAITING_CONTRACT
+      ) {
+        const {
+          data: updatedCompany,
+          error: companyUpdateError
+        } = await supabase
+          .from('companies')
+          .update({
+            registration_status: REGISTRATION.CONTRACT_APPROVED
+          })
+          .eq('id', company.id)
+          .eq('registration_status', REGISTRATION.AWAITING_CONTRACT)
+          .select('id, registration_status')
+          .maybeSingle()
+
+        if (companyUpdateError) throw companyUpdateError
+
+        if (!updatedCompany) {
+          // Recuperação de uma operação concorrente.
+          const {
+            data: refreshedCompany,
+            error: refreshCompanyError
+          } = await supabase
+            .from('companies')
+            .select('id, registration_status')
+            .eq('id', company.id)
+            .maybeSingle()
+
+          if (refreshCompanyError) throw refreshCompanyError
+
+          if (
+            !refreshedCompany ||
+            ![
+              REGISTRATION.CONTRACT_APPROVED,
+              REGISTRATION.AWAITING_PAYMENT,
+              REGISTRATION.ACTIVE
+            ].includes(refreshedCompany.registration_status)
+          ) {
+            return res.status(409).json({
+              error: 'O contrato foi aprovado, mas o estado comercial da empresa mudou. Verifique o cadastro.'
+            })
+          }
+        }
+      } else if (
+        ![
+          REGISTRATION.CONTRACT_APPROVED,
+          REGISTRATION.AWAITING_PAYMENT,
+          REGISTRATION.ACTIVE
+        ].includes(company.registration_status)
+      ) {
+        return res.status(409).json({
+          error: 'O contrato está aprovado, mas a empresa possui um estado comercial incompatível.'
+        })
+      }
+
+      // -------------------------------------------------
+      // 7. REGISTRA A OPERAÇÃO
+      // -------------------------------------------------
+
       await registerAdminLog({
-        companyId: currentContract.company_id,
-        action: decision === 'approve'
+        companyId: company.id,
+        action: newlyApproved
           ? 'contract_approved'
-          : 'contract_rejected',
+          : 'contract_approval_recovered',
         adminEmail: getAdminEmail(req),
         details: {
-          contract_id: currentContract.id,
-          contract_number: currentContract.contract_number,
-          decision,
-          subscription_id: subscription?.id || null,
-          payment_id: payment?.id || null,
-          reason: decision === 'reject'
-            ? reason
-            : null
+          contract_id: contractId,
+          contract_number: approvedContract.contract_number,
+          subscription_id: subscription.id,
+          decision: 'approve'
         }
       })
+
+      // -------------------------------------------------
+      // 8. RESPOSTA
+      // -------------------------------------------------
 
       return res.json({
         success: true,
-        message: decision === 'approve'
-          ? 'Contrato aprovado. Primeira cobrança criada.'
-          : 'Contrato rejeitado.',
-        contract,
-        subscription,
-        payment
+        message: 'Contrato aprovado. Agora você pode liberar o link de pagamento.',
+        contract: approvedContract,
+        subscription
       })
     } catch (error) {
-      logServerError(
-        'Erro na decisão do contrato',
-        error
-      )
+      logServerError('Erro na decisão do contrato', error)
 
       return res.status(500).json({
         error: 'Não foi possível concluir a decisão do contrato.'
@@ -1511,63 +1717,47 @@ router.patch(
 )
 
 // =====================================================
-// PAGAMENTOS - LISTAGEM ADMINISTRATIVA
+// PAGAMENTOS - LISTAGEM
 // =====================================================
 
 router.get('/payments', requireAdmin, async (_req, res) => {
   try {
-    if (!supabase) {
-      return databaseUnavailable(res)
-    }
+    if (!supabase) return databaseUnavailable(res)
 
-    const {
-      data: subscriptions,
-      error: subscriptionError
-    } = await supabase
-      .from('subscriptions')
-      .select(SUBSCRIPTION_SELECT)
-      .in('status', [
-        'pending',
-        'active',
-        'past_due',
-        'suspended'
-      ])
+    // Não cria cobranças automaticamente.
+    // A primeira cobrança é criada na liberação do link.
+    // As próximas são criadas após a confirmação do pagamento.
 
-    if (subscriptionError) {
-      throw subscriptionError
-    }
-
-    for (const subscription of subscriptions || []) {
-      await ensurePaymentForSubscription(subscription)
-    }
-
-    const {
-      data: payments,
-      error: paymentError
-    } = await supabase
+    const { data: payments, error } = await supabase
       .from('payments')
       .select(PAYMENT_SELECT)
       .in('status', [
-        'pending',
-        'under_review'
+        PAYMENT_STATUS.PENDING,
+        PAYMENT_STATUS.UNDER_REVIEW
       ])
       .order('created_at', { ascending: true })
 
-    if (paymentError) throw paymentError
+    if (error) throw error
 
-    const enrichedPayments = await enrichPayments(
+    const enriched = await enrichPayments(
       payments || []
     )
 
+    const visiblePayments = enriched.filter(payment => {
+      const subscription = payment.subscription
+
+      return (
+        subscription?.contract?.status === CONTRACT_STATUS.APPROVED &&
+        Boolean(subscription?.company)
+      )
+    })
+
     return res.json({
       success: true,
-      payments: enrichedPayments
+      payments: visiblePayments
     })
   } catch (error) {
-    logServerError(
-      'Erro ao listar pagamentos',
-      error
-    )
+    logServerError('Erro ao listar pagamentos', error)
 
     return res.status(500).json({
       error: 'Não foi possível carregar os pagamentos.'
@@ -1576,7 +1766,7 @@ router.get('/payments', requireAdmin, async (_req, res) => {
 })
 
 // =====================================================
-// PAGAMENTOS - HISTÓRICO ADMINISTRATIVO
+// PAGAMENTOS - HISTÓRICO
 // =====================================================
 
 router.get(
@@ -1584,16 +1774,14 @@ router.get(
   requireAdmin,
   async (_req, res) => {
     try {
-      if (!supabase) {
-        return databaseUnavailable(res)
-      }
+      if (!supabase) return databaseUnavailable(res)
 
       const { data: payments, error } = await supabase
         .from('payments')
         .select(PAYMENT_SELECT)
         .in('status', [
-          'confirmed',
-          'rejected'
+          PAYMENT_STATUS.CONFIRMED,
+          PAYMENT_STATUS.REJECTED
         ])
         .order('reviewed_at', {
           ascending: false
@@ -1602,19 +1790,18 @@ router.get(
 
       if (error) throw error
 
-      const enrichedPayments = await enrichPayments(
+      const enriched = await enrichPayments(
         payments || []
       )
 
       return res.json({
         success: true,
-        payments: enrichedPayments
+        payments: enriched.filter(payment => (
+          payment.subscription?.contract?.status === CONTRACT_STATUS.APPROVED
+        ))
       })
     } catch (error) {
-      logServerError(
-        'Erro ao listar histórico de pagamentos',
-        error
-      )
+      logServerError('Erro ao listar histórico de pagamentos', error)
 
       return res.status(500).json({
         error: 'Não foi possível carregar o histórico de pagamentos.'
@@ -1632,9 +1819,7 @@ router.get(
   requireAdmin,
   async (req, res) => {
     try {
-      if (!supabase) {
-        return databaseUnavailable(res)
-      }
+      if (!supabase) return databaseUnavailable(res)
 
       const paymentId = req.params.id
 
@@ -1699,37 +1884,18 @@ router.get(
         await file.arrayBuffer()
       )
 
-      res.setHeader(
-        'Content-Type',
-        contentType
-      )
-
+      res.setHeader('Content-Type', contentType)
       res.setHeader(
         'Content-Disposition',
         `attachment; filename="comprovante-${payment.id}${extension}"`
       )
-
-      res.setHeader(
-        'Content-Length',
-        buffer.length
-      )
-
-      res.setHeader(
-        'Cache-Control',
-        'private, no-store'
-      )
-
-      res.setHeader(
-        'X-Content-Type-Options',
-        'nosniff'
-      )
+      res.setHeader('Content-Length', buffer.length)
+      res.setHeader('Cache-Control', 'private, no-store')
+      res.setHeader('X-Content-Type-Options', 'nosniff')
 
       return res.send(buffer)
     } catch (error) {
-      logServerError(
-        'Erro ao baixar comprovante',
-        error
-      )
+      logServerError('Erro ao baixar comprovante', error)
 
       return res.status(500).json({
         error: 'Não foi possível baixar o comprovante.'
@@ -1747,19 +1913,11 @@ router.patch(
   requireAdmin,
   async (req, res) => {
     try {
-      if (!supabase) {
-        return databaseUnavailable(res)
-      }
+      if (!supabase) return databaseUnavailable(res)
 
       const paymentId = req.params.id
-
-      const decision = String(
-        req.body?.decision || ''
-      ).trim().toLowerCase()
-
-      const reason = String(
-        req.body?.reason || ''
-      ).trim()
+      const decision = getDecision(req)
+      const reason = getReason(req)
 
       if (!validUuid(paymentId)) {
         return res.status(400).json({
@@ -1767,49 +1925,36 @@ router.patch(
         })
       }
 
-      if (!['approve', 'reject'].includes(decision)) {
-        return res.status(400).json({
-          error: 'Decisão inválida. Utilize approve ou reject.'
-        })
-      }
+      const validationError = validateDecisionInput(
+        decision,
+        reason
+      )
 
-      if (
-        decision === 'reject' &&
-        reason.length < 5
-      ) {
+      if (validationError) {
         return res.status(400).json({
-          error: 'Informe uma justificativa para rejeitar o pagamento.'
-        })
-      }
-
-      if (reason.length > 2000) {
-        return res.status(400).json({
-          error: 'A justificativa ultrapassa o limite de 2.000 caracteres.'
+          error: validationError
         })
       }
 
       // -------------------------------------------------
-      // LOCALIZA PAGAMENTO
+      // 1. BUSCA PAGAMENTO
       // -------------------------------------------------
 
-      const {
-        data: payment,
-        error: paymentFindError
-      } = await supabase
-        .from('payments')
-        .select(`
-          id,
-          subscription_id,
-          amount,
-          due_date,
-          status
-        `)
-        .eq('id', paymentId)
-        .maybeSingle()
+      const { data: payment, error: paymentError } =
+        await supabase
+          .from('payments')
+          .select(`
+            id,
+            subscription_id,
+            amount,
+            due_date,
+            receipt_file_path,
+            status
+          `)
+          .eq('id', paymentId)
+          .maybeSingle()
 
-      if (paymentFindError) {
-        throw paymentFindError
-      }
+      if (paymentError) throw paymentError
 
       if (!payment) {
         return res.status(404).json({
@@ -1817,18 +1962,20 @@ router.patch(
         })
       }
 
-      if (
-        !['pending', 'under_review'].includes(
-          payment.status
-        )
-      ) {
+      if (payment.status !== PAYMENT_STATUS.UNDER_REVIEW) {
         return res.status(409).json({
-          error: 'Este pagamento já foi analisado.'
+          error: 'Este pagamento não possui comprovante aguardando análise.'
+        })
+      }
+
+      if (!payment.receipt_file_path) {
+        return res.status(409).json({
+          error: 'Não existe comprovante anexado a este pagamento.'
         })
       }
 
       // -------------------------------------------------
-      // LOCALIZA ASSINATURA
+      // 2. BUSCA ASSINATURA
       // -------------------------------------------------
 
       const {
@@ -1840,9 +1987,7 @@ router.patch(
         .eq('id', payment.subscription_id)
         .maybeSingle()
 
-      if (subscriptionError) {
-        throw subscriptionError
-      }
+      if (subscriptionError) throw subscriptionError
 
       if (!subscription) {
         return res.status(404).json({
@@ -1850,10 +1995,66 @@ router.patch(
         })
       }
 
+      // -------------------------------------------------
+      // 3. VALIDA CONTRATO APROVADO
+      // -------------------------------------------------
+
+      if (!subscription.contract_id) {
+        return res.status(409).json({
+          error: 'Esta assinatura não está vinculada a um contrato.'
+        })
+      }
+
+      const { data: contract, error: contractError } =
+        await supabase
+          .from('contracts')
+          .select(`
+            id,
+            company_id,
+            status
+          `)
+          .eq('id', subscription.contract_id)
+          .maybeSingle()
+
+      if (contractError) throw contractError
+
+      if (
+        !contract ||
+        contract.status !== CONTRACT_STATUS.APPROVED ||
+        contract.company_id !== subscription.company_id
+      ) {
+        return res.status(409).json({
+          error: 'O contrato vinculado não está aprovado.'
+        })
+      }
+
+      // -------------------------------------------------
+      // 4. BUSCA EMPRESA
+      // -------------------------------------------------
+
+      const { data: company, error: companyError } =
+        await supabase
+          .from('companies')
+          .select(`
+            id,
+            status,
+            registration_status
+          `)
+          .eq('id', subscription.company_id)
+          .maybeSingle()
+
+      if (companyError) throw companyError
+
+      if (!company) {
+        return res.status(404).json({
+          error: 'Empresa vinculada à assinatura não encontrada.'
+        })
+      }
+
       const timestamp = new Date().toISOString()
 
       // -------------------------------------------------
-      // REJEIÇÃO
+      // 5. REJEIÇÃO DO PAGAMENTO
       // -------------------------------------------------
 
       if (decision === 'reject') {
@@ -1863,52 +2064,42 @@ router.patch(
         } = await supabase
           .from('payments')
           .update({
-            status: 'rejected',
+            status: PAYMENT_STATUS.REJECTED,
             rejection_reason: reason,
             reviewed_by: null,
             reviewed_at: timestamp
           })
           .eq('id', paymentId)
-          .in('status', [
-            'pending',
-            'under_review'
-          ])
-          .select(`
-            id,
-            subscription_id,
-            amount,
-            due_date,
-            status,
-            rejection_reason,
-            reviewed_at
-          `)
+          .eq('status', PAYMENT_STATUS.UNDER_REVIEW)
+          .select(PAYMENT_SELECT)
           .maybeSingle()
 
         if (rejectError) throw rejectError
 
         if (!rejectedPayment) {
           return res.status(409).json({
-            error: 'O pagamento já foi analisado por outra operação.'
+            error: 'O pagamento já foi analisado.'
           })
         }
 
-        // Somente devolve para aguardando pagamento
-        // se o cadastro ainda estiver na primeira análise.
-        // Não altera o status de empresas já ativas.
-        const { error: companyUpdateError } = await supabase
-          .from('companies')
-          .update({
-            registration_status: 'awaiting_payment'
-          })
-          .eq('id', subscription.company_id)
-          .eq('registration_status', 'payment_under_review')
+        // Apenas cadastros iniciais retornam para
+        // aguardando pagamento. Renovações não são rebaixadas.
+        if (
+          company.registration_status === REGISTRATION.PAYMENT_UNDER_REVIEW
+        ) {
+          const { error: updateCompanyError } = await supabase
+            .from('companies')
+            .update({
+              registration_status: REGISTRATION.AWAITING_PAYMENT
+            })
+            .eq('id', company.id)
+            .eq('registration_status', REGISTRATION.PAYMENT_UNDER_REVIEW)
 
-        if (companyUpdateError) {
-          throw companyUpdateError
+          if (updateCompanyError) throw updateCompanyError
         }
 
         await registerAdminLog({
-          companyId: subscription.company_id,
+          companyId: company.id,
           action: 'payment_rejected',
           adminEmail: getAdminEmail(req),
           details: {
@@ -1927,7 +2118,7 @@ router.patch(
       }
 
       // -------------------------------------------------
-      // VALIDAÇÃO PARA APROVAÇÃO
+      // 6. VALIDA DADOS DA ASSINATURA
       // -------------------------------------------------
 
       if (!payment.due_date) {
@@ -1962,7 +2153,7 @@ router.patch(
         graceDays > 30
       ) {
         return res.status(409).json({
-          error: 'Prazo de tolerância da assinatura inválido.'
+          error: 'Prazo de tolerância inválido.'
         })
       }
 
@@ -1981,7 +2172,7 @@ router.patch(
       )
 
       // -------------------------------------------------
-      // LOCALIZA LICENÇA EXISTENTE
+      // 7. BUSCA LICENÇA EXISTENTE
       // -------------------------------------------------
 
       const {
@@ -1992,20 +2183,45 @@ router.patch(
         .select(LICENSE_SELECT)
         .eq('subscription_id', subscription.id)
         .neq('status', 'cancelled')
-        .order('activated_at', {
-          ascending: true
-        })
+        .order('activated_at', { ascending: true })
         .limit(1)
 
-      if (licenseFindError) {
-        throw licenseFindError
-      }
+      if (licenseFindError) throw licenseFindError
 
       const existingLicense =
         existingLicenses?.[0] || null
 
       // -------------------------------------------------
-      // ATUALIZA ASSINATURA
+      // 8. CONFIRMA PAGAMENTO
+      // -------------------------------------------------
+
+      const {
+        data: confirmedPayment,
+        error: confirmError
+      } = await supabase
+        .from('payments')
+        .update({
+          status: PAYMENT_STATUS.CONFIRMED,
+          payment_date: timestamp,
+          reviewed_by: null,
+          reviewed_at: timestamp,
+          rejection_reason: null
+        })
+        .eq('id', paymentId)
+        .eq('status', PAYMENT_STATUS.UNDER_REVIEW)
+        .select(PAYMENT_SELECT)
+        .maybeSingle()
+
+      if (confirmError) throw confirmError
+
+      if (!confirmedPayment) {
+        return res.status(409).json({
+          error: 'O pagamento foi alterado por outra operação.'
+        })
+      }
+
+      // -------------------------------------------------
+      // 9. ATIVA ASSINATURA
       // -------------------------------------------------
 
       const {
@@ -2026,23 +2242,23 @@ router.patch(
       }
 
       // -------------------------------------------------
-      // ATIVA EMPRESA E CADASTRO
+      // 10. ATIVA EMPRESA
       // -------------------------------------------------
 
-      const { error: companyError } = await supabase
+      const { error: updateCompanyError } = await supabase
         .from('companies')
         .update({
           status: 'active',
-          registration_status: 'active'
+          registration_status: REGISTRATION.ACTIVE
         })
-        .eq('id', subscription.company_id)
+        .eq('id', company.id)
 
-      if (companyError) {
-        throw companyError
+      if (updateCompanyError) {
+        throw updateCompanyError
       }
 
       // -------------------------------------------------
-      // CRIA OU REATIVA LICENÇA
+      // 11. CRIA OU ATUALIZA LICENÇA
       // -------------------------------------------------
 
       let license
@@ -2076,7 +2292,7 @@ router.patch(
             company_id: subscription.company_id,
             subscription_id: subscription.id,
             status: 'active',
-            activated_at: null,
+            activated_at: timestamp,
             expires_at: expiresAt
           })
           .select(LICENSE_SELECT)
@@ -2106,47 +2322,7 @@ router.patch(
       }
 
       // -------------------------------------------------
-      // CONFIRMA PAGAMENTO
-      // -------------------------------------------------
-
-      const {
-        data: confirmedPayment,
-        error: confirmError
-      } = await supabase
-        .from('payments')
-        .update({
-          status: 'confirmed',
-          payment_date: timestamp,
-          reviewed_by: null,
-          reviewed_at: timestamp,
-          rejection_reason: null
-        })
-        .eq('id', paymentId)
-        .in('status', [
-          'pending',
-          'under_review'
-        ])
-        .select(`
-          id,
-          subscription_id,
-          amount,
-          due_date,
-          payment_date,
-          status,
-          reviewed_at
-        `)
-        .maybeSingle()
-
-      if (confirmError) throw confirmError
-
-      if (!confirmedPayment) {
-        return res.status(409).json({
-          error: 'O pagamento foi alterado por outra operação. Verifique a assinatura.'
-        })
-      }
-
-      // -------------------------------------------------
-      // CRIA PRÓXIMA COBRANÇA
+      // 12. GERA PRÓXIMA COBRANÇA
       // -------------------------------------------------
 
       const nextPayment = await ensurePaymentForSubscription({
@@ -2155,11 +2331,11 @@ router.patch(
       })
 
       // -------------------------------------------------
-      // AUDITORIA
+      // 13. AUDITORIA
       // -------------------------------------------------
 
       await registerAdminLog({
-        companyId: subscription.company_id,
+        companyId: company.id,
         action: 'payment_confirmed',
         adminEmail: getAdminEmail(req),
         details: {
@@ -2174,7 +2350,7 @@ router.patch(
       })
 
       // -------------------------------------------------
-      // RESPOSTA
+      // 14. RESPOSTA
       // -------------------------------------------------
 
       return res.json({
@@ -2210,7 +2386,7 @@ router.patch(
 )
 
 // =====================================================
-// DISTRIBUIÇÃO DO ERP - LISTAGEM DE VERSÕES
+// DISTRIBUIÇÃO - LISTAGEM DE VERSÕES
 // =====================================================
 
 router.get('/releases', requireAdmin, async (_req, res) => {
@@ -2231,10 +2407,7 @@ router.get('/releases', requireAdmin, async (_req, res) => {
       releases
     })
   } catch (error) {
-    logServerError(
-      'Erro ao listar versões',
-      error
-    )
+    logServerError('Erro ao listar versões', error)
 
     return res.status(500).json({
       error: 'Não foi possível carregar as versões.'
@@ -2243,7 +2416,7 @@ router.get('/releases', requireAdmin, async (_req, res) => {
 })
 
 // =====================================================
-// DISTRIBUIÇÃO DO ERP - PUBLICAÇÃO DE VERSÕES
+// DISTRIBUIÇÃO - PUBLICAÇÃO DE VERSÕES
 // =====================================================
 
 router.post(
@@ -2338,10 +2511,7 @@ router.post(
     } catch (error) {
       await removeUploadedFile(req.file)
 
-      logServerError(
-        'Erro ao publicar versão',
-        error
-      )
+      logServerError('Erro ao publicar versão', error)
 
       return res.status(500).json({
         error: 'Não foi possível publicar a versão.'
@@ -2355,9 +2525,7 @@ router.post(
 // =====================================================
 
 router.use((error, _req, res, next) => {
-  if (!error) {
-    return next()
-  }
+  if (!error) return next()
 
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {
@@ -2377,9 +2545,7 @@ router.use((error, _req, res, next) => {
     })
   }
 
-  if (
-    error.message === 'Envie somente arquivos .exe.'
-  ) {
+  if (error.message === 'Envie somente arquivos .exe.') {
     return res.status(400).json({
       error: error.message
     })

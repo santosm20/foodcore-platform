@@ -1,4 +1,3 @@
-
 import React, { useState } from 'react'
 import AdminApp from './admin/AdminApp.jsx'
 
@@ -32,6 +31,12 @@ import {
   CustomerLoginPage,
   RegistrationPendingPage
 } from './customer/CustomerAuth.jsx'
+
+import {
+  CustomerDashboardPage,
+  CustomerPaymentPage,
+  CustomerDownloadPage
+} from './customer/CustomerPortal.jsx'
 
 import './styles/customer.css'
 
@@ -903,6 +908,15 @@ function App() {
 
     case '/aguardando-aprovacao':
       return <RegistrationPendingPage />
+
+    case '/minha-conta':
+      return <CustomerDashboardPage />
+
+    case '/pagamento':
+      return <CustomerPaymentPage />
+
+    case '/download':
+      return <CustomerDownloadPage />
 
     default:
       return <LandingPage />

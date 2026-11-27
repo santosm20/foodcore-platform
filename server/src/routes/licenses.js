@@ -130,7 +130,9 @@ async function validateLicenseStatus(license) {
   if (license.status !== 'active') {
     return {
       valid: false,
-      error: 'Licença suspensa ou inativa.'
+      error: license.status === 'suspended'
+        ? 'Licença suspensa por pendência de pagamento. Regularize pelo portal FOODCORE.'
+        : 'Licença inativa ou indisponível.'
     }
   }
 
@@ -179,7 +181,9 @@ async function validateLicenseStatus(license) {
   if (!ALLOWED_SUBSCRIPTION_STATUSES.includes(subscription.status)) {
     return {
       valid: false,
-      error: 'Assinatura suspensa ou inativa.'
+      error: subscription.status === 'suspended'
+        ? 'Assinatura suspensa por pendência de pagamento.'
+        : 'Assinatura inativa ou indisponível.'
     }
   }
 
